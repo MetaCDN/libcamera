@@ -6,22 +6,15 @@
  */
 #include "camera_hal_config.h"
 
-#if defined(_GLIBCXX_RELEASE) && _GLIBCXX_RELEASE < 8
-#include <experimental/filesystem>
-namespace std {
-namespace filesystem = std::experimental::filesystem;
-}
-#else
-#include <filesystem>
-#endif
 #include <stdlib.h>
 #include <string>
 
-#include <hardware/camera3.h>
-
+#include <libcamera/base/file.h>
 #include <libcamera/base/log.h>
 
-#include <libcamera/internal/yaml_parser.h>
+#include "libcamera/internal/yaml_parser.h"
+
+#include <hardware/camera3.h>
 
 using namespace libcamera;
 
@@ -34,7 +27,7 @@ class CameraHalConfig::Private : public Extensible::Private
 public:
 	Private();
 
-	int parseConfigFile(FILE *fh, std::map<std::string, CameraConfigData> *cameras);
+	int parseConfigFile(File &file, std::map<std::string, CameraConfigData> *cameras);
 
 private:
 	int parseCameraConfigData(const std::string &cameraId, const YamlObject &);
@@ -48,7 +41,7 @@ CameraHalConfig::Private::Private()
 {
 }
 
-int CameraHalConfig::Private::parseConfigFile(FILE *fh,
+int CameraHalConfig::Private::parseConfigFile(File &file,
 					      std::map<std::string, CameraConfigData> *cameras)
 {
 	/*
@@ -72,7 +65,7 @@ int CameraHalConfig::Private::parseConfigFile(FILE *fh,
 
 	cameras_ = cameras;
 
-	std::unique_ptr<YamlObject> root = YamlParser::parse(fh);
+	std::unique_ptr<YamlObject> root = YamlParser::parse(file);
 	if (!root)
 		return -EINVAL;
 
@@ -88,10 +81,8 @@ int CameraHalConfig::Private::parseConfigFile(FILE *fh,
 	if (!yamlObjectCameras.isDictionary())
 		return -EINVAL;
 
-	std::vector<std::string> cameraIds = yamlObjectCameras.memberNames();
-	for (const std::string &cameraId : cameraIds) {
-		if (parseCameraConfigData(cameraId,
-					  yamlObjectCameras[cameraId]))
+	for (const auto &[cameraId, configData] : yamlObjectCameras.asDict()) {
+		if (parseCameraConfigData(cameraId, configData))
 			return -EINVAL;
 	}
 
@@ -168,17 +159,17 @@ CameraHalConfig::CameraHalConfig()
  */
 int CameraHalConfig::parseConfigurationFile()
 {
-	std::filesystem::path filePath = LIBCAMERA_SYSCONF_DIR;
-	filePath /= "camera_hal.yaml";
-	if (!std::filesystem::is_regular_file(filePath)) {
+	std::string filePath = LIBCAMERA_SYSCONF_DIR "/camera_hal.yaml";
+
+	File file(filePath);
+	if (!file.exists()) {
 		LOG(HALConfig, Debug)
 			<< "Configuration file: \"" << filePath << "\" not found";
 		return -ENOENT;
 	}
 
-	FILE *fh = fopen(filePath.c_str(), "r");
-	if (!fh) {
-		int ret = -errno;
+	if (!file.open(File::OpenModeFlag::ReadOnly)) {
+		int ret = file.error();
 		LOG(HALConfig, Error) << "Failed to open configuration file "
 				      << filePath << ": " << strerror(-ret);
 		return ret;
@@ -186,8 +177,7 @@ int CameraHalConfig::parseConfigurationFile()
 
 	exists_ = true;
 
-	int ret = _d()->parseConfigFile(fh, &cameras_);
-	fclose(fh);
+	int ret = _d()->parseConfigFile(file, &cameras_);
 	if (ret)
 		return -EINVAL;
 

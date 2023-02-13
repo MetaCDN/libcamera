@@ -29,16 +29,18 @@ enum LogSeverity {
 class LogCategory
 {
 public:
-	explicit LogCategory(const char *name);
+	static LogCategory *create(const char *name);
 
-	const char *name() const { return name_; }
+	const std::string &name() const { return name_; }
 	LogSeverity severity() const { return severity_; }
 	void setSeverity(LogSeverity severity);
 
 	static const LogCategory &defaultCategory();
 
 private:
-	const char *name_;
+	explicit LogCategory(const char *name);
+
+	const std::string name_;
 	LogSeverity severity_;
 };
 
@@ -49,7 +51,7 @@ extern const LogCategory &_LOG_CATEGORY(name)();
 const LogCategory &_LOG_CATEGORY(name)()				\
 {									\
 	/* The instance will be deleted by the Logger destructor. */	\
-	static LogCategory *category = new LogCategory(#name);		\
+	static LogCategory *category = LogCategory::create(#name);	\
 	return *category;						\
 }
 
@@ -57,7 +59,8 @@ class LogMessage
 {
 public:
 	LogMessage(const char *fileName, unsigned int line,
-		   const LogCategory &category, LogSeverity severity);
+		   const LogCategory &category, LogSeverity severity,
+		   const std::string &prefix = std::string());
 
 	LogMessage(LogMessage &&);
 	~LogMessage();
@@ -68,6 +71,7 @@ public:
 	LogSeverity severity() const { return severity_; }
 	const LogCategory &category() const { return category_; }
 	const std::string &fileInfo() const { return fileInfo_; }
+	const std::string &prefix() const { return prefix_; }
 	const std::string msg() const { return msgStream_.str(); }
 
 private:
@@ -80,6 +84,7 @@ private:
 	LogSeverity severity_;
 	utils::time_point timestamp_;
 	std::string fileInfo_;
+	std::string prefix_;
 };
 
 class Loggable

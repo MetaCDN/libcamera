@@ -140,7 +140,8 @@ void CameraHalManager::cameraAdded(std::shared_ptr<Camera> cam)
 	 */
 	if (!isCameraExternal && !halConfig_.exists()) {
 		LOG(HAL, Error)
-			<< "HAL configuration file is mandatory for internal cameras";
+			<< "HAL configuration file is mandatory for internal cameras."
+			<< " Camera " << cam->id() << " failed to load";
 		return;
 	}
 
@@ -228,11 +229,7 @@ void CameraHalManager::cameraRemoved(std::shared_ptr<Camera> cam)
 
 int32_t CameraHalManager::cameraLocation(const Camera *cam)
 {
-	const ControlList &properties = cam->properties();
-	if (!properties.contains(properties::Location))
-		return -1;
-
-	return properties.get(properties::Location);
+	return cam->properties().get(properties::Location).value_or(-1);
 }
 
 CameraDevice *CameraHalManager::cameraDeviceFromHalId(unsigned int id)

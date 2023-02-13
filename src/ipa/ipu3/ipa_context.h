@@ -14,6 +14,8 @@
 
 #include <libcamera/geometry.h>
 
+#include <libipa/fc_queue.h>
+
 namespace libcamera {
 
 namespace ipa::ipu3 {
@@ -39,10 +41,11 @@ struct IPASessionConfiguration {
 	struct {
 		int32_t defVBlank;
 		utils::Duration lineDuration;
+		Size size;
 	} sensor;
 };
 
-struct IPAFrameContext {
+struct IPAActiveState {
 	struct {
 		uint32_t focus;
 		double maxVariance;
@@ -65,19 +68,23 @@ struct IPAFrameContext {
 	} awb;
 
 	struct {
-		uint32_t exposure;
-		double gain;
-	} sensor;
-
-	struct {
 		double gamma;
 		struct ipu3_uapi_gamma_corr_lut gammaCorrection;
 	} toneMapping;
 };
 
+struct IPAFrameContext : public FrameContext {
+	struct {
+		uint32_t exposure;
+		double gain;
+	} sensor;
+};
+
 struct IPAContext {
 	IPASessionConfiguration configuration;
-	IPAFrameContext frameContext;
+	IPAActiveState activeState;
+
+	FCQueue<IPAFrameContext> frameContexts;
 };
 
 } /* namespace ipa::ipu3 */

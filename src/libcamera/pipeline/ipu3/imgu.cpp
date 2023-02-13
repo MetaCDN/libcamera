@@ -479,7 +479,7 @@ int ImgUDevice::configure(const PipeConfig &pipeConfig, V4L2DeviceFormat *inputF
 	if (ret)
 		return ret;
 
-	LOG(IPU3, Debug) << "ImgU input format = " << inputFormat;
+	LOG(IPU3, Debug) << "ImgU input format = " << *inputFormat;
 
 	/*
 	 * \todo The IPU3 driver implementation shall be changed to use the
@@ -558,7 +558,7 @@ int ImgUDevice::configureVideoDevice(V4L2VideoDevice *dev, unsigned int pad,
 		return 0;
 
 	*outputFormat = {};
-	outputFormat->fourcc = V4L2PixelFormat::fromPixelFormat(formats::NV12);
+	outputFormat->fourcc = dev->toV4L2PixelFormat(formats::NV12);
 	outputFormat->size = cfg.size;
 	outputFormat->planesCount = 2;
 
@@ -568,7 +568,7 @@ int ImgUDevice::configureVideoDevice(V4L2VideoDevice *dev, unsigned int pad,
 
 	const char *name = dev == output_.get() ? "output" : "viewfinder";
 	LOG(IPU3, Debug) << "ImgU " << name << " format = "
-			 << outputFormat;
+			 << *outputFormat;
 
 	return 0;
 }

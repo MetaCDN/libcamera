@@ -16,6 +16,7 @@
 #include <string.h>
 
 #include <libcamera/property_ids.h>
+#include <libcamera/transform.h>
 
 #include <libcamera/base/utils.h>
 
@@ -55,7 +56,8 @@ LOG_DEFINE_CATEGORY(CameraSensor)
  */
 CameraSensor::CameraSensor(const MediaEntity *entity)
 	: entity_(entity), pad_(UINT_MAX), staticProps_(nullptr),
-	  bayerFormat_(nullptr), properties_(properties::properties)
+	  bayerFormat_(nullptr), supportFlips_(false),
+	  properties_(properties::properties)
 {
 }
 
@@ -152,7 +154,12 @@ int CameraSensor::init()
 	 */
 	if (entity_->device()->driver() == "vimc") {
 		initVimcDefaultProperties();
-		return initProperties();
+
+		ret = initProperties();
+		if (ret)
+			return ret;
+
+		return discoverAncillaryDevices();
 	}
 
 	/* Get the color filter array pattern (only for RAW sensors). */
@@ -175,6 +182,32 @@ int CameraSensor::init()
 	ret = discoverAncillaryDevices();
 	if (ret)
 		return ret;
+
+	/*
+	 * Set HBLANK to the minimum to start with a well-defined line length,
+	 * allowing IPA modules that do not modify HBLANK to use the sensor
+	 * minimum line length in their calculations.
+	 *
+	 * At present, there is no way of knowing if a control is read-only.
+	 * As a workaround, assume that if the minimum and maximum values of
+	 * the V4L2_CID_HBLANK control are the same, it implies the control
+	 * is read-only.
+	 *
+	 * \todo The control API ought to have a flag to specify if a control
+	 * is read-only which could be used below.
+	 */
+	const ControlInfo hblank = ctrls.infoMap()->at(V4L2_CID_HBLANK);
+	const int32_t hblankMin = hblank.min().get<int32_t>();
+	const int32_t hblankMax = hblank.max().get<int32_t>();
+
+	if (hblankMin != hblankMax) {
+		ControlList ctrl(subdev_->controls());
+
+		ctrl.set(V4L2_CID_HBLANK, hblankMin);
+		ret = subdev_->setControls(&ctrl);
+		if (ret)
+			return ret;
+	}
 
 	return applyTestPatternMode(controls::draft::TestPatternModeEnum::TestPatternModeOff);
 }
@@ -215,6 +248,21 @@ int CameraSensor::validateSensorDriver()
 			err = -EINVAL;
 		}
 	}
+
+	/*
+	 * Verify if sensor supports horizontal/vertical flips
+	 *
+	 * \todo Handle horizontal and vertical flips independently.
+	 */
+	const struct v4l2_query_ext_ctrl *hflipInfo = subdev_->controlInfo(V4L2_CID_HFLIP);
+	const struct v4l2_query_ext_ctrl *vflipInfo = subdev_->controlInfo(V4L2_CID_VFLIP);
+	if (hflipInfo && !(hflipInfo->flags & V4L2_CTRL_FLAG_READ_ONLY) &&
+	    vflipInfo && !(vflipInfo->flags & V4L2_CTRL_FLAG_READ_ONLY))
+		supportFlips_ = true;
+
+	if (!supportFlips_)
+		LOG(CameraSensor, Warning)
+			<< "Camera sensor does not support horizontal/vertical flip";
 
 	/*
 	 * Make sure the required selection targets are supported.
@@ -275,6 +323,7 @@ int CameraSensor::validateSensorDriver()
 	 * required by the CameraSensor class.
 	 */
 	static constexpr uint32_t mandatoryControls[] = {
+		V4L2_CID_ANALOGUE_GAIN,
 		V4L2_CID_EXPOSURE,
 		V4L2_CID_HBLANK,
 		V4L2_CID_PIXEL_RATE,
@@ -395,7 +444,7 @@ int CameraSensor::initProperties()
 			LOG(CameraSensor, Warning)
 				<< "Unsupported camera location "
 				<< v4l2Orientation << ", setting to External";
-			/* Fall-through */
+			[[fallthrough]];
 		case V4L2_CAMERA_ORIENTATION_EXTERNAL:
 			propertyValue = properties::CameraLocationExternal;
 			break;
@@ -467,8 +516,8 @@ int CameraSensor::discoverAncillaryDevices()
 			ret = focusLens_->init();
 			if (ret) {
 				LOG(CameraSensor, Error)
-					<< "CameraLens initialisation failed";
-				return ret;
+					<< "Lens initialisation failed, lens disabled";
+				focusLens_.reset();
 			}
 			break;
 
@@ -582,16 +631,19 @@ int CameraSensor::setTestPatternMode(controls::draft::TestPatternModeEnum mode)
 	if (testPatternMode_ == mode)
 		return 0;
 
+	if (testPatternModes_.empty()) {
+		LOG(CameraSensor, Error)
+			<< "Camera sensor does not support test pattern modes.";
+		return -EINVAL;
+	}
+
 	return applyTestPatternMode(mode);
 }
 
 int CameraSensor::applyTestPatternMode(controls::draft::TestPatternModeEnum mode)
 {
-	if (testPatternModes_.empty()) {
-		LOG(CameraSensor, Error)
-			<< "Camera sensor does not support test pattern modes.";
+	if (testPatternModes_.empty())
 		return 0;
-	}
 
 	auto it = std::find(testPatternModes_.begin(), testPatternModes_.end(),
 			    mode);
@@ -699,6 +751,7 @@ V4L2SubdeviceFormat CameraSensor::getFormat(const std::vector<unsigned int> &mbu
 		.mbus_code = bestCode,
 		.size = *bestSize,
 		.colorSpace = ColorSpace::Raw,
+		.transform = Transform::Identity,
 	};
 
 	return format;
@@ -708,12 +761,34 @@ V4L2SubdeviceFormat CameraSensor::getFormat(const std::vector<unsigned int> &mbu
  * \brief Set the sensor output format
  * \param[in] format The desired sensor output format
  *
+ * If flips are writable they are configured according to the desired Transform.
+ * Transform::Identity always corresponds to H/V flip being disabled if the
+ * controls are writable. Flips are set before the new format is applied as
+ * they can effectively change the Bayer pattern ordering.
+ *
  * The ranges of any controls associated with the sensor are also updated.
  *
  * \return 0 on success or a negative error code otherwise
  */
 int CameraSensor::setFormat(V4L2SubdeviceFormat *format)
 {
+	/* Configure flips if the sensor supports that. */
+	if (supportFlips_) {
+		ControlList flipCtrls(subdev_->controls());
+
+		flipCtrls.set(V4L2_CID_HFLIP,
+			      static_cast<int32_t>(!!(format->transform &
+						      Transform::HFlip)));
+		flipCtrls.set(V4L2_CID_VFLIP,
+			      static_cast<int32_t>(!!(format->transform &
+						      Transform::VFlip)));
+
+		int ret = subdev_->setControls(&flipCtrls);
+		if (ret)
+			return ret;
+	}
+
+	/* Apply format on the subdev. */
 	int ret = subdev_->setFormat(pad_, format);
 	if (ret)
 		return ret;
@@ -880,9 +955,11 @@ int CameraSensor::sensorInfo(IPACameraSensorInfo *info) const
 		return -EINVAL;
 	}
 
-	int32_t hblank = ctrls.get(V4L2_CID_HBLANK).get<int32_t>();
-	info->lineLength = info->outputSize.width + hblank;
 	info->pixelRate = ctrls.get(V4L2_CID_PIXEL_RATE).get<int64_t>();
+
+	const ControlInfo hblank = ctrls.infoMap()->at(V4L2_CID_HBLANK);
+	info->minLineLength = info->outputSize.width + hblank.min().get<int32_t>();
+	info->maxLineLength = info->outputSize.width + hblank.max().get<int32_t>();
 
 	const ControlInfo vblank = ctrls.infoMap()->at(V4L2_CID_VBLANK);
 	info->minFrameLength = info->outputSize.height + vblank.min().get<int32_t>();
@@ -908,6 +985,77 @@ void CameraSensor::updateControlInfo()
  * \return The focus lens controller. nullptr if no focus lens controller is
  * connected to the sensor
  */
+
+/**
+ * \brief Validate a transform request against the sensor capabilities
+ * \param[inout] transform The requested transformation, updated to match
+ * the sensor capabilities
+ *
+ * The input \a transform is the transform that the caller wants, and it is
+ * adjusted according to the capabilities of the sensor to represent the
+ * "nearest" transform that can actually be delivered.
+ *
+ * The returned Transform is the transform applied to the sensor in order to
+ * produce the input \a transform, It is also validated against the sensor's
+ * ability to perform horizontal and vertical flips.
+ *
+ * For example, if the requested \a transform is Transform::Identity and the
+ * sensor rotation is 180 degrees, the output transform will be
+ * Transform::Rot180 to correct the images so that they appear to have
+ * Transform::Identity, but only if the sensor can apply horizontal and vertical
+ * flips.
+ *
+ * \return A Transform instance that represents which transformation has been
+ * applied to the camera sensor
+ */
+Transform CameraSensor::validateTransform(Transform *transform) const
+{
+	/* Adjust the requested transform to compensate the sensor rotation. */
+	int32_t rotation = properties().get(properties::Rotation).value_or(0);
+	bool success;
+
+	Transform rotationTransform = transformFromRotation(rotation, &success);
+	if (!success)
+		LOG(CameraSensor, Warning) << "Invalid rotation of " << rotation
+					   << " degrees - ignoring";
+
+	Transform combined = *transform * rotationTransform;
+
+	/*
+	 * We combine the platform and user transform, but must "adjust away"
+	 * any combined result that includes a transform, as we can't do those.
+	 * In this case, flipping only the transpose bit is helpful to
+	 * applications - they either get the transform they requested, or have
+	 * to do a simple transpose themselves (they don't have to worry about
+	 * the other possible cases).
+	 */
+	if (!!(combined & Transform::Transpose)) {
+		/*
+		 * Flipping the transpose bit in "transform" flips it in the
+		 * combined result too (as it's the last thing that happens),
+		 * which is of course clearing it.
+		 */
+		*transform ^= Transform::Transpose;
+		combined &= ~Transform::Transpose;
+	}
+
+	/*
+	 * We also check if the sensor doesn't do h/vflips at all, in which
+	 * case we clear them, and the application will have to do everything.
+	 */
+	if (!supportFlips_ && !!combined) {
+		/*
+		 * If the sensor can do no transforms, then combined must be
+		 * changed to the identity. The only user transform that gives
+		 * rise to this is the inverse of the rotation. (Recall that
+		 * combined = transform * rotationTransform.)
+		 */
+		*transform = -rotationTransform;
+		combined = Transform::Identity;
+	}
+
+	return combined;
+}
 
 std::string CameraSensor::logPrefix() const
 {

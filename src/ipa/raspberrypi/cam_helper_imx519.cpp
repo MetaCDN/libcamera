@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: BSD-2-Clause */
 /*
  * Based on cam_helper_imx477.cpp
- * Copyright (C) 2020, Raspberry Pi (Trading) Limited
+ * Copyright (C) 2020, Raspberry Pi Ltd
  *
  * cam_helper_imx519.cpp - camera helper for imx519 sensor
  * Copyright (C) 2021, Arducam Technology co., Ltd.
@@ -15,8 +15,8 @@
 
 #include <libcamera/base/log.h>
 
-#include "cam_helper.hpp"
-#include "md_parser.hpp"
+#include "cam_helper.h"
+#include "md_parser.h"
 
 using namespace RPiController;
 using namespace libcamera;
@@ -36,21 +36,24 @@ constexpr uint32_t gainHiReg = 0x0204;
 constexpr uint32_t gainLoReg = 0x0205;
 constexpr uint32_t frameLengthHiReg = 0x0340;
 constexpr uint32_t frameLengthLoReg = 0x0341;
+constexpr uint32_t lineLengthHiReg = 0x0342;
+constexpr uint32_t lineLengthLoReg = 0x0343;
 constexpr std::initializer_list<uint32_t> registerList =
-	{ expHiReg, expLoReg, gainHiReg, gainLoReg, frameLengthHiReg, frameLengthLoReg  };
+	{ expHiReg, expLoReg, gainHiReg, gainLoReg, frameLengthHiReg, frameLengthLoReg,
+	  lineLengthHiReg, lineLengthLoReg };
 
 class CamHelperImx519 : public CamHelper
 {
 public:
 	CamHelperImx519();
-	uint32_t GainCode(double gain) const override;
-	double Gain(uint32_t gain_code) const override;
-	void Prepare(libcamera::Span<const uint8_t> buffer, Metadata &metadata) override;
-	uint32_t GetVBlanking(Duration &exposure, Duration minFrameDuration,
-			      Duration maxFrameDuration) const override;
-	void GetDelays(int &exposure_delay, int &gain_delay,
-		       int &vblank_delay) const override;
-	bool SensorEmbeddedDataPresent() const override;
+	uint32_t gainCode(double gain) const override;
+	double gain(uint32_t gainCode) const override;
+	void prepare(libcamera::Span<const uint8_t> buffer, Metadata &metadata) override;
+	std::pair<uint32_t, uint32_t> getBlanking(Duration &exposure, Duration minFrameDuration,
+						  Duration maxFrameDuration) const override;
+	void getDelays(int &exposureDelay, int &gainDelay,
+		       int &vblankDelay, int &hblankDelay) const override;
+	bool sensorEmbeddedDataPresent() const override;
 
 private:
 	/*
@@ -63,7 +66,7 @@ private:
 	/* Largest long exposure scale factor given as a left shift on the frame length. */
 	static constexpr int longExposureShiftMax = 7;
 
-	void PopulateMetadata(const MdParser::RegisterMap &registers,
+	void populateMetadata(const MdParser::RegisterMap &registers,
 			      Metadata &metadata) const override;
 };
 
@@ -72,22 +75,22 @@ CamHelperImx519::CamHelperImx519()
 {
 }
 
-uint32_t CamHelperImx519::GainCode(double gain) const
+uint32_t CamHelperImx519::gainCode(double gain) const
 {
 	return static_cast<uint32_t>(1024 - 1024 / gain);
 }
 
-double CamHelperImx519::Gain(uint32_t gain_code) const
+double CamHelperImx519::gain(uint32_t gainCode) const
 {
-	return 1024.0 / (1024 - gain_code);
+	return 1024.0 / (1024 - gainCode);
 }
 
-void CamHelperImx519::Prepare(libcamera::Span<const uint8_t> buffer, Metadata &metadata)
+void CamHelperImx519::prepare(libcamera::Span<const uint8_t> buffer, Metadata &metadata)
 {
 	MdParser::RegisterMap registers;
 	DeviceStatus deviceStatus;
 
-	if (metadata.Get("device.status", deviceStatus)) {
+	if (metadata.get("device.status", deviceStatus)) {
 		LOG(IPARPI, Error) << "DeviceStatus not found from DelayedControls";
 		return;
 	}
@@ -105,28 +108,32 @@ void CamHelperImx519::Prepare(libcamera::Span<const uint8_t> buffer, Metadata &m
 	 * Otherwise, all values are updated with what is reported in the
 	 * embedded data.
 	 */
-	if (deviceStatus.frame_length > frameLengthMax) {
+	if (deviceStatus.frameLength > frameLengthMax) {
 		DeviceStatus parsedDeviceStatus;
 
-		metadata.Get("device.status", parsedDeviceStatus);
-		parsedDeviceStatus.shutter_speed = deviceStatus.shutter_speed;
-		parsedDeviceStatus.frame_length = deviceStatus.frame_length;
-		metadata.Set("device.status", parsedDeviceStatus);
+		metadata.get("device.status", parsedDeviceStatus);
+		parsedDeviceStatus.shutterSpeed = deviceStatus.shutterSpeed;
+		parsedDeviceStatus.frameLength = deviceStatus.frameLength;
+		metadata.set("device.status", parsedDeviceStatus);
 
 		LOG(IPARPI, Debug) << "Metadata updated for long exposure: "
 				   << parsedDeviceStatus;
 	}
 }
 
-uint32_t CamHelperImx519::GetVBlanking(Duration &exposure,
-				       Duration minFrameDuration,
-				       Duration maxFrameDuration) const
+std::pair<uint32_t, uint32_t> CamHelperImx519::getBlanking(Duration &exposure,
+							   Duration minFrameDuration,
+							   Duration maxFrameDuration) const
 {
 	uint32_t frameLength, exposureLines;
 	unsigned int shift = 0;
 
-	frameLength = mode_.height + CamHelper::GetVBlanking(exposure, minFrameDuration,
-							     maxFrameDuration);
+	auto [vblank, hblank] = CamHelper::getBlanking(exposure, minFrameDuration,
+						       maxFrameDuration);
+
+	frameLength = mode_.height + vblank;
+	Duration lineLength = hblankToLineLength(hblank);
+
 	/*
 	 * Check if the frame length calculated needs to be setup for long
 	 * exposure mode. This will require us to use a long exposure scale
@@ -144,42 +151,46 @@ uint32_t CamHelperImx519::GetVBlanking(Duration &exposure,
 	if (shift) {
 		/* Account for any rounding in the scaled frame length value. */
 		frameLength <<= shift;
-		exposureLines = ExposureLines(exposure);
+		exposureLines = CamHelperImx519::exposureLines(exposure, lineLength);
 		exposureLines = std::min(exposureLines, frameLength - frameIntegrationDiff);
-		exposure = Exposure(exposureLines);
+		exposure = CamHelperImx519::exposure(exposureLines, lineLength);
 	}
 
-	return frameLength - mode_.height;
+	return { frameLength - mode_.height, hblank };
 }
 
-void CamHelperImx519::GetDelays(int &exposure_delay, int &gain_delay,
-				int &vblank_delay) const
+void CamHelperImx519::getDelays(int &exposureDelay, int &gainDelay,
+				int &vblankDelay, int &hblankDelay) const
 {
-	exposure_delay = 2;
-	gain_delay = 2;
-	vblank_delay = 3;
+	exposureDelay = 2;
+	gainDelay = 2;
+	vblankDelay = 3;
+	hblankDelay = 3;
 }
 
-bool CamHelperImx519::SensorEmbeddedDataPresent() const
+bool CamHelperImx519::sensorEmbeddedDataPresent() const
 {
 	return true;
 }
 
-void CamHelperImx519::PopulateMetadata(const MdParser::RegisterMap &registers,
+void CamHelperImx519::populateMetadata(const MdParser::RegisterMap &registers,
 				       Metadata &metadata) const
 {
 	DeviceStatus deviceStatus;
 
-	deviceStatus.shutter_speed = Exposure(registers.at(expHiReg) * 256 + registers.at(expLoReg));
-	deviceStatus.analogue_gain = Gain(registers.at(gainHiReg) * 256 + registers.at(gainLoReg));
-	deviceStatus.frame_length = registers.at(frameLengthHiReg) * 256 + registers.at(frameLengthLoReg);
+	deviceStatus.lineLength = lineLengthPckToDuration(registers.at(lineLengthHiReg) * 256 +
+							  registers.at(lineLengthLoReg));
+	deviceStatus.shutterSpeed = exposure(registers.at(expHiReg) * 256 + registers.at(expLoReg),
+					     deviceStatus.lineLength);
+	deviceStatus.analogueGain = gain(registers.at(gainHiReg) * 256 + registers.at(gainLoReg));
+	deviceStatus.frameLength = registers.at(frameLengthHiReg) * 256 + registers.at(frameLengthLoReg);
 
-	metadata.Set("device.status", deviceStatus);
+	metadata.set("device.status", deviceStatus);
 }
 
-static CamHelper *Create()
+static CamHelper *create()
 {
 	return new CamHelperImx519();
 }
 
-static RegisterCamHelper reg("imx519", &Create);
+static RegisterCamHelper reg("imx519", &create);

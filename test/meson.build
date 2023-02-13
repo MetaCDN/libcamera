@@ -7,6 +7,22 @@ endif
 
 test_enabled = true
 
+# When ASan is enabled, find the path to the ASan runtime needed by multiple
+# tests. This currently works with gcc only, as clang uses different file names
+# depending on the compiler version and target architecture.
+asan_enabled = false
+asan_runtime_missing = false
+
+if get_option('b_sanitize').contains('address')
+    asan_enabled = true
+
+    if cc.get_id() == 'gcc'
+        asan_runtime = run_command(cc, '-print-file-name=libasan.so', check : true).stdout().strip()
+    else
+        asan_runtime_missing = true
+    endif
+endif
+
 subdir('libtest')
 
 subdir('camera')
@@ -16,7 +32,6 @@ subdir('ipa')
 subdir('ipc')
 subdir('log')
 subdir('media_device')
-subdir('pipeline')
 subdir('process')
 subdir('py')
 subdir('serialization')
@@ -26,66 +41,82 @@ subdir('v4l2_subdevice')
 subdir('v4l2_videodevice')
 
 public_tests = [
-    ['geometry',                        'geometry.cpp'],
-    ['public-api',                      'public-api.cpp'],
-    ['signal',                          'signal.cpp'],
-    ['span',                            'span.cpp'],
+    {'name': 'color-space', 'sources': ['color-space.cpp']},
+    {'name': 'geometry', 'sources': ['geometry.cpp']},
+    {'name': 'public-api', 'sources': ['public-api.cpp']},
+    {'name': 'signal', 'sources': ['signal.cpp']},
+    {'name': 'span', 'sources': ['span.cpp']},
 ]
 
 internal_tests = [
-    ['bayer-format',                    'bayer-format.cpp'],
-    ['byte-stream-buffer',              'byte-stream-buffer.cpp'],
-    ['camera-sensor',                   'camera-sensor.cpp'],
-    ['delayed_controls',                'delayed_controls.cpp'],
-    ['event',                           'event.cpp'],
-    ['event-dispatcher',                'event-dispatcher.cpp'],
-    ['event-thread',                    'event-thread.cpp'],
-    ['file',                            'file.cpp'],
-    ['flags',                           'flags.cpp'],
-    ['hotplug-cameras',                 'hotplug-cameras.cpp'],
-    ['message',                         'message.cpp'],
-    ['object',                          'object.cpp'],
-    ['object-delete',                   'object-delete.cpp'],
-    ['object-invoke',                   'object-invoke.cpp'],
-    ['pixel-format',                    'pixel-format.cpp'],
-    ['shared-fd',                       'shared-fd.cpp'],
-    ['signal-threads',                  'signal-threads.cpp'],
-    ['threads',                         'threads.cpp'],
-    ['timer',                           'timer.cpp'],
-    ['timer-thread',                    'timer-thread.cpp'],
-    ['unique-fd',                       'unique-fd.cpp'],
-    ['utils',                           'utils.cpp'],
-    ['yaml-parser',                     'yaml-parser.cpp'],
+    {'name': 'bayer-format', 'sources': ['bayer-format.cpp']},
+    {'name': 'byte-stream-buffer', 'sources': ['byte-stream-buffer.cpp']},
+    {'name': 'camera-sensor', 'sources': ['camera-sensor.cpp']},
+    {'name': 'delayed_controls', 'sources': ['delayed_controls.cpp']},
+    {'name': 'event', 'sources': ['event.cpp']},
+    {'name': 'event-dispatcher', 'sources': ['event-dispatcher.cpp']},
+    {'name': 'event-thread', 'sources': ['event-thread.cpp']},
+    {'name': 'file', 'sources': ['file.cpp']},
+    {'name': 'flags', 'sources': ['flags.cpp']},
+    {'name': 'hotplug-cameras', 'sources': ['hotplug-cameras.cpp']},
+    {'name': 'message', 'sources': ['message.cpp']},
+    {'name': 'object', 'sources': ['object.cpp']},
+    {'name': 'object-delete', 'sources': ['object-delete.cpp']},
+    {'name': 'object-invoke', 'sources': ['object-invoke.cpp']},
+    {'name': 'pixel-format', 'sources': ['pixel-format.cpp']},
+    {'name': 'shared-fd', 'sources': ['shared-fd.cpp']},
+    {'name': 'signal-threads', 'sources': ['signal-threads.cpp']},
+    {'name': 'threads', 'sources': 'threads.cpp', 'dependencies': [libthreads]},
+    {'name': 'timer', 'sources': ['timer.cpp']},
+    {'name': 'timer-thread', 'sources': ['timer-thread.cpp']},
+    {'name': 'unique-fd', 'sources': ['unique-fd.cpp']},
+    {'name': 'utils', 'sources': ['utils.cpp']},
+    {'name': 'yaml-parser', 'sources': ['yaml-parser.cpp']},
 ]
 
 internal_non_parallel_tests = [
-    ['fence',                           'fence.cpp'],
-    ['mapped-buffer',                   'mapped-buffer.cpp'],
+    {'name': 'fence', 'sources': ['fence.cpp']},
+    {'name': 'mapped-buffer', 'sources': ['mapped-buffer.cpp']},
 ]
 
-foreach t : public_tests
-    exe = executable(t[0], t[1],
-                     dependencies : libcamera_public,
+foreach test : public_tests
+    deps = [libcamera_public]
+    if 'dependencies' in test
+        deps += test['dependencies']
+    endif
+
+    exe = executable(test['name'], test['sources'],
+                     dependencies : deps,
                      link_with : test_libraries,
                      include_directories : test_includes_public)
 
-    test(t[0], exe)
+    test(test['name'], exe)
 endforeach
 
-foreach t : internal_tests
-    exe = executable(t[0], t[1],
-                     dependencies : libcamera_private,
+foreach test : internal_tests
+    deps = [libcamera_private]
+    if 'dependencies' in test
+        deps += test['dependencies']
+    endif
+
+    exe = executable(test['name'], test['sources'],
+                     dependencies : deps,
                      link_with : test_libraries,
                      include_directories : test_includes_internal)
 
-    test(t[0], exe)
+    test(test['name'], exe)
 endforeach
 
-foreach t : internal_non_parallel_tests
-    exe = executable(t[0], t[1],
-                     dependencies : libcamera_private,
+foreach test : internal_non_parallel_tests
+    deps = [libcamera_private]
+    if 'dependencies' in test
+        deps += test['dependencies']
+    endif
+
+    exe = executable(test['name'], test['sources'],
+                     dependencies : deps,
                      link_with : test_libraries,
                      include_directories : test_includes_internal)
 
-    test(t[0], exe, is_parallel : false)
+    test(test['name'], exe, is_parallel : false)
 endforeach

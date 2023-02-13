@@ -52,9 +52,11 @@ LOG_DECLARE_CATEGORY(HAL)
 
 CameraStream::CameraStream(CameraDevice *const cameraDevice,
 			   CameraConfiguration *config, Type type,
-			   camera3_stream_t *camera3Stream, unsigned int index)
+			   camera3_stream_t *camera3Stream,
+			   CameraStream *const sourceStream, unsigned int index)
 	: cameraDevice_(cameraDevice), config_(config), type_(type),
-	  camera3Stream_(camera3Stream), index_(index)
+	  camera3Stream_(camera3Stream), sourceStream_(sourceStream),
+	  index_(index)
 {
 }
 
@@ -126,10 +128,8 @@ int CameraStream::configure()
 		worker_->start();
 	}
 
-	if (type_ == Type::Internal) {
-		allocator_ = std::make_unique<PlatformFrameBufferAllocator>(cameraDevice_);
-		mutex_ = std::make_unique<Mutex>();
-	}
+	allocator_ = std::make_unique<PlatformFrameBufferAllocator>(cameraDevice_);
+	mutex_ = std::make_unique<Mutex>();
 
 	camera3Stream_->max_buffers = configuration().bufferCount;
 

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: BSD-2-Clause
 #
-# Copyright (C) 2019, Raspberry Pi (Trading) Limited
+# Copyright (C) 2019, Raspberry Pi Ltd
 #
 # ctt_alsc.py - camera tuning tool for ALSC (auto lens shading correction)
 
@@ -132,7 +132,7 @@ def alsc(Cam, Img, do_alsc_colour, plot=False):
     """
     average the green channels into one
     """
-    av_ch_g = np.mean((channels[1:2]), axis=0)
+    av_ch_g = np.mean((channels[1:3]), axis=0)
     if do_alsc_colour:
         """
         obtain 16x12 grid of intensities for each channel and subtract black level

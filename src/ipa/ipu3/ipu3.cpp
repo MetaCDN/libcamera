@@ -18,6 +18,7 @@
 #include <linux/intel-ipu3.h>
 #include <linux/v4l2-controls.h>
 
+#include <libcamera/base/file.h>
 #include <libcamera/base/log.h>
 #include <libcamera/base/utils.h>
 
@@ -29,6 +30,7 @@
 #include <libcamera/request.h>
 
 #include "libcamera/internal/mapped_framebuffer.h"
+#include "libcamera/internal/yaml_parser.h"
 
 #include "algorithms/af.h"
 #include "algorithms/agc.h"
@@ -37,6 +39,8 @@
 #include "algorithms/blc.h"
 #include "algorithms/tone_mapping.h"
 #include "libipa/camera_sensor_helper.h"
+
+#include "ipa_context.h"
 
 /* Minimum grid width, expressed as a number of cells */
 static constexpr uint32_t kMinGridWidth = 16;
@@ -50,6 +54,9 @@ static constexpr uint32_t kMaxGridHeight = 60;
 static constexpr uint32_t kMinCellSizeLog2 = 3;
 /* log2 of the maximum grid cell width and height, in pixels */
 static constexpr uint32_t kMaxCellSizeLog2 = 6;
+
+/* Maximum number of frame contexts to be held */
+static constexpr uint32_t kMaxFrameContexts = 16;
 
 namespace libcamera {
 
@@ -71,7 +78,7 @@ namespace ipa::ipu3 {
  *
  * At initialisation time, a CameraSensorHelper is instantiated to support
  * camera-specific calculations, while the default controls are computed, and
- * the algorithms are constructed and placed in an ordered list.
+ * the algorithms are instantiated from the tuning data file.
  *
  * The IPU3 ImgU operates with a grid layout to divide the overall frame into
  * rectangular cells of pixels. When the IPA is configured, we determine the
@@ -92,12 +99,14 @@ namespace ipa::ipu3 {
  * fillParamsBuffer() call.
  *
  * The individual algorithms are split into modular components that are called
- * iteratively to allow them to process statistics from the ImgU in a defined
- * order.
+ * iteratively to allow them to process statistics from the ImgU in the order
+ * defined in the tuning data file.
  *
- * The current implementation supports three core algorithms:
- * - Automatic white balance (AWB)
+ * The current implementation supports five core algorithms:
+ *
+ * - Auto focus (AF)
  * - Automatic gain and exposure control (AGC)
+ * - Automatic white balance (AWB)
  * - Black level correction (BLC)
  * - Tone mapping (Gamma)
  *
@@ -128,9 +137,11 @@ namespace ipa::ipu3 {
  * sensor-specific tuning to adapt for Black Level compensation (BLC), Lens
  * shading correction (SHD) and Color correction (CCM).
  */
-class IPAIPU3 : public IPAIPU3Interface
+class IPAIPU3 : public IPAIPU3Interface, public Module
 {
 public:
+	IPAIPU3();
+
 	int init(const IPASettings &settings,
 		 const IPACameraSensorInfo &sensorInfo,
 		 const ControlInfoMap &sensorControls,
@@ -150,13 +161,15 @@ public:
 	void processStatsBuffer(const uint32_t frame, const int64_t frameTimestamp,
 				const uint32_t bufferId,
 				const ControlList &sensorControls) override;
+
+protected:
+	std::string logPrefix() const override;
+
 private:
 	void updateControls(const IPACameraSensorInfo &sensorInfo,
 			    const ControlInfoMap &sensorControls,
 			    ControlInfoMap *ipaControls);
 	void updateSessionConfiguration(const ControlInfoMap &sensorControls);
-
-	bool validateSensorControls();
 
 	void setControls(unsigned int frame);
 	void calculateBdsGrid(const Size &bdsOutputSize);
@@ -171,12 +184,19 @@ private:
 	/* Interface to the Camera Helper */
 	std::unique_ptr<CameraSensorHelper> camHelper_;
 
-	/* Maintain the algorithms used by the IPA */
-	std::list<std::unique_ptr<ipa::ipu3::Algorithm>> algorithms_;
-
 	/* Local parameter storage */
 	struct IPAContext context_;
 };
+
+IPAIPU3::IPAIPU3()
+	: context_({ {}, {}, { kMaxFrameContexts } })
+{
+}
+
+std::string IPAIPU3::logPrefix() const
+{
+	return "ipu3";
+}
 
 /**
  * \brief Compute IPASessionConfiguration using the sensor information and the
@@ -271,28 +291,6 @@ void IPAIPU3::updateControls(const IPACameraSensorInfo &sensorInfo,
 }
 
 /**
- * \brief Validate that the sensor controls mandatory for the IPA exists
- */
-bool IPAIPU3::validateSensorControls()
-{
-	static const uint32_t ctrls[] = {
-		V4L2_CID_ANALOGUE_GAIN,
-		V4L2_CID_EXPOSURE,
-		V4L2_CID_VBLANK,
-	};
-
-	for (auto c : ctrls) {
-		if (sensorCtrls_.find(c) == sensorCtrls_.end()) {
-			LOG(IPAIPU3, Error) << "Unable to find sensor control "
-					    << utils::hex(c);
-			return false;
-		}
-	}
-
-	return true;
-}
-
-/**
  * \brief Initialize the IPA module and its controls
  *
  * This function receives the camera sensor information from the pipeline
@@ -304,7 +302,7 @@ int IPAIPU3::init(const IPASettings &settings,
 		  const ControlInfoMap &sensorControls,
 		  ControlInfoMap *ipaControls)
 {
-	camHelper_ = CameraSensorHelperFactory::create(settings.sensorModel);
+	camHelper_ = CameraSensorHelperFactoryBase::create(settings.sensorModel);
 	if (camHelper_ == nullptr) {
 		LOG(IPAIPU3, Error)
 			<< "Failed to create camera sensor helper for "
@@ -313,15 +311,40 @@ int IPAIPU3::init(const IPASettings &settings,
 	}
 
 	/* Clean context */
-	context_ = {};
-	context_.configuration.sensor.lineDuration = sensorInfo.lineLength * 1.0s / sensorInfo.pixelRate;
+	context_.configuration = {};
+	context_.configuration.sensor.lineDuration = sensorInfo.minLineLength
+						   * 1.0s / sensorInfo.pixelRate;
 
-	/* Construct our Algorithms */
-	algorithms_.push_back(std::make_unique<algorithms::Af>());
-	algorithms_.push_back(std::make_unique<algorithms::Agc>());
-	algorithms_.push_back(std::make_unique<algorithms::Awb>());
-	algorithms_.push_back(std::make_unique<algorithms::BlackLevelCorrection>());
-	algorithms_.push_back(std::make_unique<algorithms::ToneMapping>());
+	/* Load the tuning data file. */
+	File file(settings.configurationFile);
+	if (!file.open(File::OpenModeFlag::ReadOnly)) {
+		int ret = file.error();
+		LOG(IPAIPU3, Error)
+			<< "Failed to open configuration file "
+			<< settings.configurationFile << ": " << strerror(-ret);
+		return ret;
+	}
+
+	std::unique_ptr<libcamera::YamlObject> data = YamlParser::parse(file);
+	if (!data)
+		return -EINVAL;
+
+	unsigned int version = (*data)["version"].get<uint32_t>(0);
+	if (version != 1) {
+		LOG(IPAIPU3, Error)
+			<< "Invalid tuning file version " << version;
+		return -EINVAL;
+	}
+
+	if (!data->contains("algorithms")) {
+		LOG(IPAIPU3, Error)
+			<< "Tuning file doesn't contain any algorithm";
+		return -EINVAL;
+	}
+
+	int ret = createAlgorithms(context_, (*data)["algorithms"]);
+	if (ret)
+		return ret;
 
 	/* Initialize controls. */
 	updateControls(sensorInfo, sensorControls, ipaControls);
@@ -348,6 +371,7 @@ int IPAIPU3::start()
  */
 void IPAIPU3::stop()
 {
+	context_.frameContexts.clear();
 }
 
 /**
@@ -446,6 +470,16 @@ int IPAIPU3::configure(const IPAConfigInfo &configInfo,
 
 	lensCtrls_ = configInfo.lensControls;
 
+	/* Clear the IPA context for the new streaming session. */
+	context_.activeState = {};
+	context_.configuration = {};
+	context_.frameContexts.clear();
+
+	/* Initialise the sensor configuration. */
+	context_.configuration.sensor.lineDuration = sensorInfo_.minLineLength
+						   * 1.0s / sensorInfo_.pixelRate;
+	context_.configuration.sensor.size = sensorInfo_.outputSize;
+
 	/*
 	 * Compute the sensor V4L2 controls to be used by the algorithms and
 	 * to be set on the sensor.
@@ -454,21 +488,13 @@ int IPAIPU3::configure(const IPAConfigInfo &configInfo,
 
 	calculateBdsGrid(configInfo.bdsOutputSize);
 
-	/* Clean frameContext at each reconfiguration. */
-	context_.frameContext = {};
-
-	if (!validateSensorControls()) {
-		LOG(IPAIPU3, Error) << "Sensor control validation failed.";
-		return -EINVAL;
-	}
-
 	/* Update the camera controls using the new sensor settings. */
 	updateControls(sensorInfo_, sensorCtrls_, ipaControls);
 
 	/* Update the IPASessionConfiguration using the sensor settings. */
 	updateSessionConfiguration(sensorCtrls_);
 
-	for (auto const &algo : algorithms_) {
+	for (auto const &algo : algorithms()) {
 		int ret = algo->configure(context_, configInfo);
 		if (ret)
 			return ret;
@@ -536,8 +562,10 @@ void IPAIPU3::fillParamsBuffer(const uint32_t frame, const uint32_t bufferId)
 	 */
 	params->use = {};
 
-	for (auto const &algo : algorithms_)
-		algo->prepare(context_, params);
+	IPAFrameContext &frameContext = context_.frameContexts.get(frame);
+
+	for (auto const &algo : algorithms())
+		algo->prepare(context_, frame, frameContext, params);
 
 	paramsBufferReady.emit(frame);
 }
@@ -567,27 +595,17 @@ void IPAIPU3::processStatsBuffer(const uint32_t frame,
 	const ipu3_uapi_stats_3a *stats =
 		reinterpret_cast<ipu3_uapi_stats_3a *>(mem.data());
 
-	context_.frameContext.sensor.exposure = sensorControls.get(V4L2_CID_EXPOSURE).get<int32_t>();
-	context_.frameContext.sensor.gain = camHelper_->gain(sensorControls.get(V4L2_CID_ANALOGUE_GAIN).get<int32_t>());
+	IPAFrameContext &frameContext = context_.frameContexts.get(frame);
 
-	double lineDuration = context_.configuration.sensor.lineDuration.get<std::micro>();
-	int32_t vBlank = context_.configuration.sensor.defVBlank;
-	ControlList ctrls(controls::controls);
+	frameContext.sensor.exposure = sensorControls.get(V4L2_CID_EXPOSURE).get<int32_t>();
+	frameContext.sensor.gain = camHelper_->gain(sensorControls.get(V4L2_CID_ANALOGUE_GAIN).get<int32_t>());
 
-	for (auto const &algo : algorithms_)
-		algo->process(context_, stats);
+	ControlList metadata(controls::controls);
+
+	for (auto const &algo : algorithms())
+		algo->process(context_, frame, frameContext, stats, metadata);
 
 	setControls(frame);
-
-	/* \todo Use VBlank value calculated from each frame exposure. */
-	int64_t frameDuration = (vBlank + sensorInfo_.outputSize.height) * lineDuration;
-	ctrls.set(controls::FrameDuration, frameDuration);
-
-	ctrls.set(controls::AnalogueGain, context_.frameContext.sensor.gain);
-
-	ctrls.set(controls::ColourTemperature, context_.frameContext.awb.temperatureK);
-
-	ctrls.set(controls::ExposureTime, context_.frameContext.sensor.exposure * lineDuration);
 
 	/*
 	 * \todo The Metadata provides a path to getting extended data
@@ -597,7 +615,7 @@ void IPAIPU3::processStatsBuffer(const uint32_t frame,
 	 * likely want to avoid putting platform specific metadata in.
 	 */
 
-	metadataReady.emit(frame, ctrls);
+	metadataReady.emit(frame, metadata);
 }
 
 /**
@@ -608,10 +626,12 @@ void IPAIPU3::processStatsBuffer(const uint32_t frame,
  * Parse the request to handle any IPA-managed controls that were set from the
  * application such as manual sensor settings.
  */
-void IPAIPU3::queueRequest([[maybe_unused]] const uint32_t frame,
-			   [[maybe_unused]] const ControlList &controls)
+void IPAIPU3::queueRequest(const uint32_t frame, const ControlList &controls)
 {
-	/* \todo Start processing for 'frame' based on 'controls'. */
+	IPAFrameContext &frameContext = context_.frameContexts.alloc(frame);
+
+	for (auto const &algo : algorithms())
+		algo->queueRequest(context_, frame, frameContext, controls);
 }
 
 /**
@@ -623,8 +643,8 @@ void IPAIPU3::queueRequest([[maybe_unused]] const uint32_t frame,
  */
 void IPAIPU3::setControls(unsigned int frame)
 {
-	int32_t exposure = context_.frameContext.agc.exposure;
-	int32_t gain = camHelper_->gainCode(context_.frameContext.agc.gain);
+	int32_t exposure = context_.activeState.agc.exposure;
+	int32_t gain = camHelper_->gainCode(context_.activeState.agc.gain);
 
 	ControlList ctrls(sensorCtrls_);
 	ctrls.set(V4L2_CID_EXPOSURE, exposure);
@@ -632,7 +652,7 @@ void IPAIPU3::setControls(unsigned int frame)
 
 	ControlList lensCtrls(lensCtrls_);
 	lensCtrls.set(V4L2_CID_FOCUS_ABSOLUTE,
-		      static_cast<int32_t>(context_.frameContext.af.focus));
+		      static_cast<int32_t>(context_.activeState.af.focus));
 
 	setSensorControls.emit(frame, ctrls, lensCtrls);
 }

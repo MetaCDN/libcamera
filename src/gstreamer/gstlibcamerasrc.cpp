@@ -32,8 +32,11 @@
 #include <queue>
 #include <vector>
 
+#include <libcamera/base/mutex.h>
+
 #include <libcamera/camera.h>
 #include <libcamera/camera_manager.h>
+#include <libcamera/control_ids.h>
 
 #include <gst/base/base.h>
 
@@ -51,15 +54,18 @@ struct RequestWrap {
 	RequestWrap(std::unique_ptr<Request> request);
 	~RequestWrap();
 
-	void attachBuffer(GstBuffer *buffer);
+	void attachBuffer(Stream *stream, GstBuffer *buffer);
 	GstBuffer *detachBuffer(Stream *stream);
 
 	std::unique_ptr<Request> request_;
 	std::map<Stream *, GstBuffer *> buffers_;
+
+	GstClockTime latency_;
+	GstClockTime pts_;
 };
 
 RequestWrap::RequestWrap(std::unique_ptr<Request> request)
-	: request_(std::move(request))
+	: request_(std::move(request)), latency_(0), pts_(GST_CLOCK_TIME_NONE)
 {
 }
 
@@ -71,10 +77,9 @@ RequestWrap::~RequestWrap()
 	}
 }
 
-void RequestWrap::attachBuffer(GstBuffer *buffer)
+void RequestWrap::attachBuffer(Stream *stream, GstBuffer *buffer)
 {
 	FrameBuffer *fb = gst_libcamera_buffer_get_frame_buffer(buffer);
-	Stream *stream = gst_libcamera_buffer_get_stream(buffer);
 
 	request_->addBuffer(stream, fb);
 
@@ -107,11 +112,31 @@ struct GstLibcameraSrcState {
 	std::shared_ptr<CameraManager> cm_;
 	std::shared_ptr<Camera> cam_;
 	std::unique_ptr<CameraConfiguration> config_;
-	std::vector<GstPad *> srcpads_;
-	std::queue<std::unique_ptr<RequestWrap>> requests_;
+
+	std::vector<GstPad *> srcpads_; /* Protected by stream_lock */
+
+	/*
+	 * Contention on this lock_ must be minimized, as it has to be taken in
+	 * the realtime-sensitive requestCompleted() handler to protect
+	 * queuedRequests_ and completedRequests_.
+	 *
+	 * stream_lock must be taken before lock_ in contexts where both locks
+	 * need to be taken. In particular, this means that the lock_ must not
+	 * be held while calling into other graph elements (e.g. when calling
+	 * gst_pad_query()).
+	 */
+	Mutex lock_;
+	std::queue<std::unique_ptr<RequestWrap>> queuedRequests_
+		LIBCAMERA_TSA_GUARDED_BY(lock_);
+	std::queue<std::unique_ptr<RequestWrap>> completedRequests_
+		LIBCAMERA_TSA_GUARDED_BY(lock_);
+
+	ControlList initControls_;
 	guint group_id_;
 
+	int queueRequest();
 	void requestCompleted(Request *request);
+	int processRequest();
 };
 
 struct _GstLibcameraSrc {
@@ -136,7 +161,7 @@ G_DEFINE_TYPE_WITH_CODE(GstLibcameraSrc, gst_libcamera_src, GST_TYPE_ELEMENT,
 			GST_DEBUG_CATEGORY_INIT(source_debug, "libcamerasrc", 0,
 						"libcamera Source"))
 
-#define TEMPLATE_CAPS GST_STATIC_CAPS("video/x-raw; image/jpeg")
+#define TEMPLATE_CAPS GST_STATIC_CAPS("video/x-raw; image/jpeg; video/x-bayer")
 
 /* For the simple case, we have a src pad that is always present. */
 GstStaticPadTemplate src_template = {
@@ -148,15 +173,59 @@ GstStaticPadTemplate request_src_template = {
 	"src_%u", GST_PAD_SRC, GST_PAD_REQUEST, TEMPLATE_CAPS
 };
 
+/* Must be called with stream_lock held. */
+int GstLibcameraSrcState::queueRequest()
+{
+	std::unique_ptr<Request> request = cam_->createRequest();
+	if (!request)
+		return -ENOMEM;
+
+	std::unique_ptr<RequestWrap> wrap =
+		std::make_unique<RequestWrap>(std::move(request));
+
+	for (GstPad *srcpad : srcpads_) {
+		Stream *stream = gst_libcamera_pad_get_stream(srcpad);
+		GstLibcameraPool *pool = gst_libcamera_pad_get_pool(srcpad);
+		GstBuffer *buffer;
+		GstFlowReturn ret;
+
+		ret = gst_buffer_pool_acquire_buffer(GST_BUFFER_POOL(pool),
+						     &buffer, nullptr);
+		if (ret != GST_FLOW_OK) {
+			/*
+			 * RequestWrap has ownership of the request, and we
+			 * won't be queueing this one due to lack of buffers.
+			 */
+			return -ENOBUFS;
+		}
+
+		wrap->attachBuffer(stream, buffer);
+	}
+
+	GST_TRACE_OBJECT(src_, "Requesting buffers");
+	cam_->queueRequest(wrap->request_.get());
+
+	{
+		MutexLocker locker(lock_);
+		queuedRequests_.push(std::move(wrap));
+	}
+
+	/* The RequestWrap will be deleted in the completion handler. */
+	return 0;
+}
+
 void
 GstLibcameraSrcState::requestCompleted(Request *request)
 {
-	GLibLocker lock(GST_OBJECT(src_));
-
 	GST_DEBUG_OBJECT(src_, "buffers are ready");
 
-	std::unique_ptr<RequestWrap> wrap = std::move(requests_.front());
-	requests_.pop();
+	std::unique_ptr<RequestWrap> wrap;
+
+	{
+		MutexLocker locker(lock_);
+		wrap = std::move(queuedRequests_.front());
+		queuedRequests_.pop();
+	}
 
 	g_return_if_fail(wrap->request_.get() == request);
 
@@ -165,23 +234,61 @@ GstLibcameraSrcState::requestCompleted(Request *request)
 		return;
 	}
 
-	GstBuffer *buffer;
+	if (GST_ELEMENT_CLOCK(src_)) {
+		int64_t timestamp = request->metadata().get(controls::SensorTimestamp).value_or(0);
+
+		GstClockTime gst_base_time = GST_ELEMENT(src_)->base_time;
+		GstClockTime gst_now = gst_clock_get_time(GST_ELEMENT_CLOCK(src_));
+		/* \todo Need to expose which reference clock the timestamp relates to. */
+		GstClockTime sys_now = g_get_monotonic_time() * 1000;
+
+		/* Deduced from: sys_now - sys_base_time == gst_now - gst_base_time */
+		GstClockTime sys_base_time = sys_now - (gst_now - gst_base_time);
+		wrap->pts_ = timestamp - sys_base_time;
+		wrap->latency_ = sys_now - timestamp;
+	}
+
+	{
+		MutexLocker locker(lock_);
+		completedRequests_.push(std::move(wrap));
+	}
+
+	gst_task_resume(src_->task);
+}
+
+/* Must be called with stream_lock held. */
+int GstLibcameraSrcState::processRequest()
+{
+	std::unique_ptr<RequestWrap> wrap;
+	int err = 0;
+
+	{
+		MutexLocker locker(lock_);
+
+		if (!completedRequests_.empty()) {
+			wrap = std::move(completedRequests_.front());
+			completedRequests_.pop();
+		}
+
+		if (completedRequests_.empty())
+			err = -ENOBUFS;
+	}
+
+	if (!wrap)
+		return -ENOBUFS;
+
+	GstFlowReturn ret = GST_FLOW_OK;
+	gst_flow_combiner_reset(src_->flow_combiner);
+
 	for (GstPad *srcpad : srcpads_) {
 		Stream *stream = gst_libcamera_pad_get_stream(srcpad);
-		buffer = wrap->detachBuffer(stream);
+		GstBuffer *buffer = wrap->detachBuffer(stream);
 
 		FrameBuffer *fb = gst_libcamera_buffer_get_frame_buffer(buffer);
 
-		if (GST_ELEMENT_CLOCK(src_)) {
-			GstClockTime gst_base_time = GST_ELEMENT(src_)->base_time;
-			GstClockTime gst_now = gst_clock_get_time(GST_ELEMENT_CLOCK(src_));
-			/* \todo Need to expose which reference clock the timestamp relates to. */
-			GstClockTime sys_now = g_get_monotonic_time() * 1000;
-
-			/* Deduced from: sys_now - sys_base_time == gst_now - gst_base_time */
-			GstClockTime sys_base_time = sys_now - (gst_now - gst_base_time);
-			GST_BUFFER_PTS(buffer) = fb->metadata().timestamp - sys_base_time;
-			gst_libcamera_pad_set_latency(srcpad, sys_now - fb->metadata().timestamp);
+		if (GST_CLOCK_TIME_IS_VALID(wrap->pts_)) {
+			GST_BUFFER_PTS(buffer) = wrap->pts_;
+			gst_libcamera_pad_set_latency(srcpad, wrap->latency_);
 		} else {
 			GST_BUFFER_PTS(buffer) = 0;
 		}
@@ -189,10 +296,26 @@ GstLibcameraSrcState::requestCompleted(Request *request)
 		GST_BUFFER_OFFSET(buffer) = fb->metadata().sequence;
 		GST_BUFFER_OFFSET_END(buffer) = fb->metadata().sequence;
 
-		gst_libcamera_pad_queue_buffer(srcpad, buffer);
+		ret = gst_pad_push(srcpad, buffer);
+		ret = gst_flow_combiner_update_pad_flow(src_->flow_combiner,
+							srcpad, ret);
 	}
 
-	gst_libcamera_resume_task(this->src_->task);
+	if (ret != GST_FLOW_OK) {
+		if (ret == GST_FLOW_EOS) {
+			g_autoptr(GstEvent) eos = gst_event_new_eos();
+			guint32 seqnum = gst_util_seqnum_next();
+			gst_event_set_seqnum(eos, seqnum);
+			for (GstPad *srcpad : srcpads_)
+				gst_pad_push_event(srcpad, gst_event_ref(eos));
+		} else if (ret != GST_FLOW_FLUSHING) {
+			GST_ELEMENT_FLOW_ERROR(src_, ret);
+		}
+
+		return -EPIPE;
+	}
+
+	return err;
 }
 
 static bool
@@ -262,87 +385,72 @@ gst_libcamera_src_task_run(gpointer user_data)
 	GstLibcameraSrc *self = GST_LIBCAMERA_SRC(user_data);
 	GstLibcameraSrcState *state = self->state;
 
-	std::unique_ptr<Request> request = state->cam_->createRequest();
-	if (!request) {
+	/*
+	 * Start by pausing the task. The task may also get resumed by the
+	 * buffer-notify signal when new buffers are queued back to the pool,
+	 * or by the request completion handler when a new request has
+	 * completed.  Both will resume the task after adding the buffers or
+	 * request to their respective lists, which are checked below to decide
+	 * if the task needs to be resumed for another iteration. This is thus
+	 * guaranteed to be race-free, the lock taken by gst_task_pause() and
+	 * gst_task_resume() serves as a memory barrier.
+	 */
+	gst_task_pause(self->task);
+
+	bool doResume = false;
+
+	/*
+	 * Create and queue one request. If no buffers are available the
+	 * function returns -ENOBUFS, which we ignore here as that's not a
+	 * fatal error.
+	 */
+	int ret = state->queueRequest();
+	switch (ret) {
+	case 0:
+		/*
+		 * The request was successfully queued, there may be enough
+		 * buffers to create a new one. Don't pause the task to give it
+		 * another try.
+		 */
+		doResume = true;
+		break;
+
+	case -ENOMEM:
 		GST_ELEMENT_ERROR(self, RESOURCE, NO_SPACE_LEFT,
 				  ("Failed to allocate request for camera '%s'.",
 				   state->cam_->id().c_str()),
 				  ("libcamera::Camera::createRequest() failed"));
 		gst_task_stop(self->task);
 		return;
+
+	case -ENOBUFS:
+	default:
+		break;
 	}
 
-	std::unique_ptr<RequestWrap> wrap =
-		std::make_unique<RequestWrap>(std::move(request));
+	/*
+	 * Process one completed request, if available, and record if further
+	 * requests are ready for processing.
+	 */
+	ret = state->processRequest();
+	switch (ret) {
+	case 0:
+		/* Another completed request is available, resume the task. */
+		doResume = true;
+		break;
 
-	for (GstPad *srcpad : state->srcpads_) {
-		GstLibcameraPool *pool = gst_libcamera_pad_get_pool(srcpad);
-		GstBuffer *buffer;
-		GstFlowReturn ret;
+	case -EPIPE:
+		gst_task_stop(self->task);
+		return;
 
-		ret = gst_buffer_pool_acquire_buffer(GST_BUFFER_POOL(pool),
-						     &buffer, nullptr);
-		if (ret != GST_FLOW_OK) {
-			/*
-			 * RequestWrap has ownership of the request, and we
-			 * won't be queueing this one due to lack of buffers.
-			 */
-			wrap.release();
-			break;
-		}
-
-		wrap->attachBuffer(buffer);
+	case -ENOBUFS:
+	default:
+		break;
 	}
 
-	if (wrap) {
-		GLibLocker lock(GST_OBJECT(self));
-		GST_TRACE_OBJECT(self, "Requesting buffers");
-		state->cam_->queueRequest(wrap->request_.get());
-		state->requests_.push(std::move(wrap));
-
-		/* The RequestWrap will be deleted in the completion handler. */
-	}
-
-	GstFlowReturn ret = GST_FLOW_OK;
-	gst_flow_combiner_reset(self->flow_combiner);
-	for (GstPad *srcpad : state->srcpads_) {
-		ret = gst_libcamera_pad_push_pending(srcpad);
-		ret = gst_flow_combiner_update_pad_flow(self->flow_combiner,
-							srcpad, ret);
-	}
-
-	{
-		if (ret != GST_FLOW_OK) {
-			if (ret == GST_FLOW_EOS) {
-				g_autoptr(GstEvent) eos = gst_event_new_eos();
-				guint32 seqnum = gst_util_seqnum_next();
-				gst_event_set_seqnum(eos, seqnum);
-				for (GstPad *srcpad : state->srcpads_)
-					gst_pad_push_event(srcpad, gst_event_ref(eos));
-			} else if (ret != GST_FLOW_FLUSHING) {
-				GST_ELEMENT_FLOW_ERROR(self, ret);
-			}
-			gst_task_stop(self->task);
-			return;
-		}
-
-		/*
-		 * Here we need to decide if we want to pause. This needs to
-		 * happen in lock step with the callback thread which may want
-		 * to resume the task and might push pending buffers.
-		 */
-		GLibLocker lock(GST_OBJECT(self));
-		bool do_pause = true;
-		for (GstPad *srcpad : state->srcpads_) {
-			if (gst_libcamera_pad_has_pending(srcpad)) {
-				do_pause = false;
-				break;
-			}
-		}
-
-		if (do_pause)
-			gst_task_pause(self->task);
-	}
+	/* Resume the task for another iteration if needed. */
+	if (doResume)
+		gst_task_resume(self->task);
 }
 
 static void
@@ -354,6 +462,8 @@ gst_libcamera_src_task_enter(GstTask *task, [[maybe_unused]] GThread *thread,
 	GstLibcameraSrcState *state = self->state;
 	GstFlowReturn flow_ret = GST_FLOW_OK;
 	gint ret;
+
+	g_autoptr(GstStructure) element_caps = gst_structure_new_empty("caps");
 
 	GST_DEBUG_OBJECT(self, "Streaming thread has started");
 
@@ -397,6 +507,7 @@ gst_libcamera_src_task_enter(GstTask *task, [[maybe_unused]] GThread *thread,
 		/* Fixate caps and configure the stream. */
 		caps = gst_caps_make_writable(caps);
 		gst_libcamera_configure_stream_from_caps(stream_cfg, caps);
+		gst_libcamera_get_framerate_from_caps(caps, element_caps);
 	}
 
 	if (flow_ret != GST_FLOW_OK)
@@ -408,6 +519,20 @@ gst_libcamera_src_task_enter(GstTask *task, [[maybe_unused]] GThread *thread,
 		goto done;
 	}
 
+	ret = state->cam_->configure(state->config_.get());
+	if (ret) {
+		GST_ELEMENT_ERROR(self, RESOURCE, SETTINGS,
+				  ("Failed to configure camera: %s", g_strerror(-ret)),
+				  ("Camera::configure() failed with error code %i", ret));
+		gst_task_stop(task);
+		flow_ret = GST_FLOW_NOT_NEGOTIATED;
+		goto done;
+	}
+
+	/* Check frame duration bounds within controls::FrameDurationLimits */
+	gst_libcamera_clamp_and_set_frameduration(state->initControls_,
+						  state->cam_->controls(), element_caps);
+
 	/*
 	 * Regardless if it has been modified, create clean caps and push the
 	 * caps event. Downstream will decide if the caps are acceptable.
@@ -417,6 +542,8 @@ gst_libcamera_src_task_enter(GstTask *task, [[maybe_unused]] GThread *thread,
 		const StreamConfiguration &stream_cfg = state->config_->at(i);
 
 		g_autoptr(GstCaps) caps = gst_libcamera_stream_configuration_to_caps(stream_cfg);
+		gst_libcamera_framerate_to_caps(caps, element_caps);
+
 		if (!gst_pad_push_event(srcpad, gst_event_new_caps(caps))) {
 			flow_ret = GST_FLOW_NOT_NEGOTIATED;
 			break;
@@ -426,15 +553,6 @@ gst_libcamera_src_task_enter(GstTask *task, [[maybe_unused]] GThread *thread,
 		GstSegment segment;
 		gst_segment_init(&segment, GST_FORMAT_TIME);
 		gst_pad_push_event(srcpad, gst_event_new_segment(&segment));
-	}
-
-	ret = state->cam_->configure(state->config_.get());
-	if (ret) {
-		GST_ELEMENT_ERROR(self, RESOURCE, SETTINGS,
-				  ("Failed to configure camera: %s", g_strerror(-ret)),
-				  ("Camera::configure() failed with error code %i", ret));
-		gst_task_stop(task);
-		return;
 	}
 
 	self->allocator = gst_libcamera_allocator_new(state->cam_, state->config_.get());
@@ -453,13 +571,13 @@ gst_libcamera_src_task_enter(GstTask *task, [[maybe_unused]] GThread *thread,
 		GstLibcameraPool *pool = gst_libcamera_pool_new(self->allocator,
 								stream_cfg.stream());
 		g_signal_connect_swapped(pool, "buffer-notify",
-					 G_CALLBACK(gst_libcamera_resume_task), task);
+					 G_CALLBACK(gst_task_resume), task);
 
 		gst_libcamera_pad_set_pool(srcpad, pool);
 		gst_flow_combiner_add_pad(self->flow_combiner, srcpad);
 	}
 
-	ret = state->cam_->start();
+	ret = state->cam_->start(&state->initControls_);
 	if (ret) {
 		GST_ELEMENT_ERROR(self, RESOURCE, SETTINGS,
 				  ("Failed to start the camera: %s", g_strerror(-ret)),
@@ -469,6 +587,7 @@ gst_libcamera_src_task_enter(GstTask *task, [[maybe_unused]] GThread *thread,
 	}
 
 done:
+	state->initControls_.clear();
 	switch (flow_ret) {
 	case GST_FLOW_NOT_NEGOTIATED:
 		GST_ELEMENT_FLOW_ERROR(self, flow_ret);
@@ -491,8 +610,16 @@ gst_libcamera_src_task_leave([[maybe_unused]] GstTask *task,
 
 	state->cam_->stop();
 
-	for (GstPad *srcpad : state->srcpads_)
-		gst_libcamera_pad_set_pool(srcpad, nullptr);
+	{
+		MutexLocker locker(state->lock_);
+		state->completedRequests_ = {};
+	}
+
+	{
+		GLibRecLocker locker(&self->stream_lock);
+		for (GstPad *srcpad : state->srcpads_)
+			gst_libcamera_pad_set_pool(srcpad, nullptr);
+	}
 
 	g_clear_object(&self->allocator);
 	g_clear_pointer(&self->flow_combiner,
@@ -631,7 +758,7 @@ gst_libcamera_src_init(GstLibcameraSrc *self)
 	gst_task_set_lock(self->task, &self->stream_lock);
 
 	state->srcpads_.push_back(gst_pad_new_from_template(templ, "src"));
-	gst_element_add_pad(GST_ELEMENT(self), state->srcpads_[0]);
+	gst_element_add_pad(GST_ELEMENT(self), state->srcpads_.back());
 
 	/* C-style friend. */
 	state->src_ = self;
@@ -651,7 +778,7 @@ gst_libcamera_src_request_new_pad(GstElement *element, GstPadTemplate *templ,
 	g_object_ref_sink(pad);
 
 	if (gst_element_add_pad(element, pad)) {
-		GLibLocker lock(GST_OBJECT(self));
+		GLibRecLocker lock(&self->stream_lock);
 		self->state->srcpads_.push_back(reinterpret_cast<GstPad *>(g_object_ref(pad)));
 	} else {
 		GST_ELEMENT_ERROR(element, STREAM, FAILED,
@@ -671,7 +798,7 @@ gst_libcamera_src_release_pad(GstElement *element, GstPad *pad)
 	GST_DEBUG_OBJECT(self, "Pad %" GST_PTR_FORMAT " being released", pad);
 
 	{
-		GLibLocker lock(GST_OBJECT(self));
+		GLibRecLocker lock(&self->stream_lock);
 		std::vector<GstPad *> &pads = self->state->srcpads_;
 		auto begin_iterator = pads.begin();
 		auto end_iterator = pads.end();

@@ -7,9 +7,9 @@ from collections import defaultdict
 import errno
 import gc
 import libcamera as libcam
-import os
 import selectors
 import time
+import typing
 import unittest
 import weakref
 
@@ -70,6 +70,9 @@ class SimpleTestMethods(BaseTestCase):
 
 
 class CameraTesterBase(BaseTestCase):
+    cm: typing.Any
+    cam: typing.Any
+
     def setUp(self):
         self.cm = libcam.CameraManager.singleton()
         self.cam = next((cam for cam in self.cm.cameras if 'platform/vimc' in cam.id), None)
@@ -83,6 +86,9 @@ class CameraTesterBase(BaseTestCase):
             self.cm = None
             raise Exception('Failed to acquire camera')
 
+        self.wr_cam = weakref.ref(self.cam)
+        self.wr_cm = weakref.ref(self.cm)
+
     def tearDown(self):
         # If a test fails, the camera may be in running state. So always stop.
         self.cam.stop()
@@ -93,6 +99,9 @@ class CameraTesterBase(BaseTestCase):
 
         self.cam = None
         self.cm = None
+
+        self.assertIsNone(self.wr_cm())
+        self.assertIsNone(self.wr_cam())
 
 
 class AllocatorTestMethods(CameraTesterBase):
@@ -125,6 +134,7 @@ class AllocatorTestMethods(CameraTesterBase):
         wr_allocator = weakref.ref(allocator)
 
         buffers = allocator.buffers(stream)
+        self.assertIsNotNone(buffers)
         buffers = None
 
         buffer = allocator.buffers(stream)[0]
@@ -151,7 +161,7 @@ class AllocatorTestMethods(CameraTesterBase):
 
 
 class SimpleCaptureMethods(CameraTesterBase):
-    def test_sleep(self):
+    def test_blocking(self):
         cm = self.cm
         cam = self.cam
 
@@ -160,65 +170,8 @@ class SimpleCaptureMethods(CameraTesterBase):
 
         streamconfig = camconfig.at(0)
         fmts = streamconfig.formats
-
-        ret = cam.configure(camconfig)
-        self.assertZero(ret)
-
-        stream = streamconfig.stream
-
-        allocator = libcam.FrameBufferAllocator(cam)
-        ret = allocator.allocate(stream)
-        self.assertTrue(ret > 0)
-
-        num_bufs = len(allocator.buffers(stream))
-
-        reqs = []
-        for i in range(num_bufs):
-            req = cam.create_request(i)
-            self.assertIsNotNone(req)
-
-            buffer = allocator.buffers(stream)[i]
-            ret = req.add_buffer(stream, buffer)
-            self.assertZero(ret)
-
-            reqs.append(req)
-
-        buffer = None
-
-        ret = cam.start()
-        self.assertZero(ret)
-
-        for req in reqs:
-            ret = cam.queue_request(req)
-            self.assertZero(ret)
-
-        reqs = None
-        gc.collect()
-
-        time.sleep(0.5)
-
-        reqs = cm.get_ready_requests()
-
-        self.assertTrue(len(reqs) == num_bufs)
-
-        for i, req in enumerate(reqs):
-            self.assertTrue(i == req.cookie)
-
-        reqs = None
-        gc.collect()
-
-        ret = cam.stop()
-        self.assertZero(ret)
-
-    def test_select(self):
-        cm = self.cm
-        cam = self.cam
-
-        camconfig = cam.generate_configuration([libcam.StreamRole.StillCapture])
-        self.assertTrue(camconfig.size == 1)
-
-        streamconfig = camconfig.at(0)
-        fmts = streamconfig.formats
+        self.assertIsNotNone(fmts)
+        fmts = None
 
         ret = cam.configure(camconfig)
         self.assertZero(ret)
@@ -255,19 +208,87 @@ class SimpleCaptureMethods(CameraTesterBase):
         gc.collect()
 
         sel = selectors.DefaultSelector()
-        sel.register(cm.efd, selectors.EVENT_READ)
+        sel.register(cm.event_fd, selectors.EVENT_READ)
+
+        reqs = []
+
+        while True:
+            events = sel.select()
+            if not events:
+                continue
+
+            ready_reqs = cm.get_ready_requests()
+
+            reqs += ready_reqs
+
+            if len(reqs) == num_bufs:
+                break
+
+        for i, req in enumerate(reqs):
+            self.assertTrue(i == req.cookie)
+
+        reqs = None
+        gc.collect()
+
+        ret = cam.stop()
+        self.assertZero(ret)
+
+    def test_select(self):
+        cm = self.cm
+        cam = self.cam
+
+        camconfig = cam.generate_configuration([libcam.StreamRole.StillCapture])
+        self.assertTrue(camconfig.size == 1)
+
+        streamconfig = camconfig.at(0)
+        fmts = streamconfig.formats
+        self.assertIsNotNone(fmts)
+        fmts = None
+
+        ret = cam.configure(camconfig)
+        self.assertZero(ret)
+
+        stream = streamconfig.stream
+
+        allocator = libcam.FrameBufferAllocator(cam)
+        ret = allocator.allocate(stream)
+        self.assertTrue(ret > 0)
+
+        num_bufs = len(allocator.buffers(stream))
+
+        reqs = []
+        for i in range(num_bufs):
+            req = cam.create_request(i)
+            self.assertIsNotNone(req)
+
+            buffer = allocator.buffers(stream)[i]
+            ret = req.add_buffer(stream, buffer)
+            self.assertZero(ret)
+
+            reqs.append(req)
+
+        buffer = None
+
+        ret = cam.start()
+        self.assertZero(ret)
+
+        for req in reqs:
+            ret = cam.queue_request(req)
+            self.assertZero(ret)
+
+        reqs = None
+        gc.collect()
+
+        sel = selectors.DefaultSelector()
+        sel.register(cm.event_fd, selectors.EVENT_READ)
 
         reqs = []
 
         running = True
         while running:
             events = sel.select()
-            for key, mask in events:
-                os.read(key.fileobj, 8)
-
+            for key, _ in events:
                 ready_reqs = cm.get_ready_requests()
-
-                self.assertTrue(len(ready_reqs) > 0)
 
                 reqs += ready_reqs
 
@@ -342,9 +363,9 @@ if __name__ == '__main__':
         gc.unfreeze()
         gc.collect()
 
-        obs_after = get_all_objects([obs_before])
+        obs_after = get_all_objects([obs_before])   # type: ignore
 
-        before = create_type_count_map(obs_before)
+        before = create_type_count_map(obs_before)  # type: ignore
         after = create_type_count_map(obs_after)
 
         leaks = diff_type_count_maps(before, after)

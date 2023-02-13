@@ -5,16 +5,11 @@ from PyQt5 import QtCore, QtWidgets
 from PyQt5.QtCore import Qt
 
 import math
-import numpy as np
 import os
 import sys
 
 os.environ['PYOPENGL_PLATFORM'] = 'egl'
 
-import OpenGL
-# OpenGL.FULL_LOGGING = True
-
-from OpenGL import GL as gl
 from OpenGL.EGL.EXT.image_dma_buf_import import *
 from OpenGL.EGL.KHR.image import *
 from OpenGL.EGL.VERSION.EGL_1_0 import *
@@ -29,14 +24,6 @@ from OpenGL.GLES3.VERSION.GLES3_3_0 import *
 from OpenGL.GL import shaders
 
 from gl_helpers import *
-
-# libcamera format string -> DRM fourcc
-FMT_MAP = {
-    'RGB888': 'RG24',
-    'XRGB8888': 'XR24',
-    'ARGB8888': 'AR24',
-    'YUYV': 'YUYV',
-}
 
 
 class EglState:
@@ -150,17 +137,16 @@ class QtRenderer:
         self.app = QtWidgets.QApplication([])
 
         window = MainWindow(self.state)
-        window.setAttribute(QtCore.Qt.WA_ShowWithoutActivating)
         window.show()
 
         self.window = window
 
     def run(self):
-        camnotif = QtCore.QSocketNotifier(self.state['cm'].efd, QtCore.QSocketNotifier.Read)
-        camnotif.activated.connect(lambda x: self.readcam())
+        camnotif = QtCore.QSocketNotifier(self.state.cm.event_fd, QtCore.QSocketNotifier.Read)
+        camnotif.activated.connect(lambda _: self.readcam())
 
         keynotif = QtCore.QSocketNotifier(sys.stdin.fileno(), QtCore.QSocketNotifier.Read)
-        keynotif.activated.connect(lambda x: self.readkey())
+        keynotif.activated.connect(lambda _: self.readkey())
 
         print('Capturing...')
 
@@ -169,7 +155,7 @@ class QtRenderer:
         print('Exiting...')
 
     def readcam(self):
-        running = self.state['event_handler'](self.state)
+        running = self.state.event_handler()
 
         if not running:
             self.app.quit()
@@ -198,18 +184,12 @@ class MainWindow(QtWidgets.QWidget):
         self.reqqueue = {}
         self.current = {}
 
-        for ctx in self.state['contexts']:
+        for ctx in self.state.contexts:
 
-            self.reqqueue[ctx['idx']] = []
-            self.current[ctx['idx']] = []
+            self.reqqueue[ctx.idx] = []
+            self.current[ctx.idx] = []
 
-            for stream in ctx['streams']:
-                fmt = stream.configuration.pixel_format
-                size = stream.configuration.size
-
-                if fmt not in FMT_MAP:
-                    raise Exception('Unsupported pixel format: ' + str(fmt))
-
+            for stream in ctx.streams:
                 self.textures[stream] = None
 
         num_tiles = len(self.textures)
@@ -281,15 +261,15 @@ class MainWindow(QtWidgets.QWidget):
 
     def create_texture(self, stream, fb):
         cfg = stream.configuration
-        fmt = cfg.pixel_format
-        fmt = str_to_fourcc(FMT_MAP[fmt])
-        w, h = cfg.size
+        fmt = cfg.pixel_format.fourcc
+        w = cfg.size.width
+        h = cfg.size.height
 
         attribs = [
             EGL_WIDTH, w,
             EGL_HEIGHT, h,
             EGL_LINUX_DRM_FOURCC_EXT, fmt,
-            EGL_DMA_BUF_PLANE0_FD_EXT, fb.fd(0),
+            EGL_DMA_BUF_PLANE0_FD_EXT, fb.planes[0].fd,
             EGL_DMA_BUF_PLANE0_OFFSET_EXT, 0,
             EGL_DMA_BUF_PLANE0_PITCH_EXT, cfg.stride,
             EGL_NONE,
@@ -332,12 +312,12 @@ class MainWindow(QtWidgets.QWidget):
             if len(queue) == 0:
                 continue
 
-            ctx = next(ctx for ctx in self.state['contexts'] if ctx['idx'] == ctx_idx)
+            ctx = next(ctx for ctx in self.state.contexts if ctx.idx == ctx_idx)
 
             if self.current[ctx_idx]:
                 old = self.current[ctx_idx]
                 self.current[ctx_idx] = None
-                self.state['request_prcessed'](ctx, old)
+                self.state.request_processed(ctx, old)
 
             next_req = queue.pop(0)
             self.current[ctx_idx] = next_req
@@ -356,8 +336,8 @@ class MainWindow(QtWidgets.QWidget):
 
         size = self.size()
 
-        for idx, ctx in enumerate(self.state['contexts']):
-            for stream in ctx['streams']:
+        for idx, ctx in enumerate(self.state.contexts):
+            for stream in ctx.streams:
                 if self.textures[stream] is None:
                     continue
 
@@ -379,5 +359,5 @@ class MainWindow(QtWidgets.QWidget):
         assert(b)
 
     def handle_request(self, ctx, req):
-        self.reqqueue[ctx['idx']].append(req)
+        self.reqqueue[ctx.idx].append(req)
         self.update()

@@ -7,8 +7,6 @@
 
 #pragma once
 
-#include <linux/rkisp1-config.h>
-
 #include "algorithm.h"
 
 namespace libcamera {
@@ -18,15 +16,25 @@ namespace ipa::rkisp1::algorithms {
 class Awb : public Algorithm
 {
 public:
-	Awb() = default;
+	Awb();
 	~Awb() = default;
 
 	int configure(IPAContext &context, const IPACameraSensorInfo &configInfo) override;
-	void prepare(IPAContext &context, rkisp1_params_cfg *params) override;
-	void process(IPAContext &context, const rkisp1_stat_buffer *stats) override;
+	void queueRequest(IPAContext &context, const uint32_t frame,
+			  IPAFrameContext &frameContext,
+			  const ControlList &controls) override;
+	void prepare(IPAContext &context, const uint32_t frame,
+		     IPAFrameContext &frameContext,
+		     rkisp1_params_cfg *params) override;
+	void process(IPAContext &context, const uint32_t frame,
+		     IPAFrameContext &frameContext,
+		     const rkisp1_stat_buffer *stats,
+		     ControlList &metadata) override;
 
 private:
 	uint32_t estimateCCT(double red, double green, double blue);
+
+	bool rgbMode_;
 };
 
 } /* namespace ipa::rkisp1::algorithms */

@@ -1,14 +1,12 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 /*
- * Copyright (C) 2020, Raspberry Pi (Trading) Ltd.
+ * Copyright (C) 2020, Raspberry Pi Ltd
  *
  * rpi_stream.cpp - Raspberry Pi device stream abstraction class.
  */
 #include "rpi_stream.h"
 
 #include <libcamera/base/log.h>
-
-#include <libcamera/ipa/raspberrypi_ipa_interface.h>
 
 namespace libcamera {
 
@@ -74,7 +72,7 @@ int Stream::getBufferId(FrameBuffer *buffer) const
 
 void Stream::setExternalBuffer(FrameBuffer *buffer)
 {
-	bufferMap_.emplace(ipa::RPi::MaskExternalBuffer | id_.get(), buffer);
+	bufferMap_.emplace(BufferMask::MaskExternalBuffer | id_.get(), buffer);
 }
 
 void Stream::removeExternalBuffer(FrameBuffer *buffer)
@@ -82,7 +80,7 @@ void Stream::removeExternalBuffer(FrameBuffer *buffer)
 	int id = getBufferId(buffer);
 
 	/* Ensure we have this buffer in the stream, and it is marked external. */
-	ASSERT(id != -1 && (id & ipa::RPi::MaskExternalBuffer));
+	ASSERT(id != -1 && (id & BufferMask::MaskExternalBuffer));
 	bufferMap_.erase(id);
 }
 

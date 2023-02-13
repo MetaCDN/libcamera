@@ -11,6 +11,8 @@
 #include <queue>
 #include <vector>
 
+#include <linux/intel-ipu3.h>
+
 #include <libcamera/base/log.h>
 #include <libcamera/base/utils.h>
 
@@ -49,7 +51,7 @@ class IPU3CameraData : public Camera::Private
 {
 public:
 	IPU3CameraData(PipelineHandler *pipe)
-		: Camera::Private(pipe), supportsFlips_(false)
+		: Camera::Private(pipe)
 	{
 	}
 
@@ -71,7 +73,6 @@ public:
 	Stream rawStream_;
 
 	Rectangle cropRegion_;
-	bool supportsFlips_;
 	Transform rotationTransform_;
 
 	std::unique_ptr<DelayedControls> delayedCtrls_;
@@ -134,7 +135,7 @@ public:
 
 	PipelineHandlerIPU3(CameraManager *manager);
 
-	CameraConfiguration *generateConfiguration(Camera *camera,
+	std::unique_ptr<CameraConfiguration> generateConfiguration(Camera *camera,
 		const StreamRoles &roles) override;
 	int configure(Camera *camera, CameraConfiguration *config) override;
 
@@ -182,48 +183,15 @@ CameraConfiguration::Status IPU3CameraConfiguration::validate()
 	if (config_.empty())
 		return Invalid;
 
-	Transform combined = transform * data_->rotationTransform_;
-
 	/*
-	 * We combine the platform and user transform, but must "adjust away"
-	 * any combined result that includes a transposition, as we can't do
-	 * those. In this case, flipping only the transpose bit is helpful to
-	 * applications - they either get the transform they requested, or have
-	 * to do a simple transpose themselves (they don't have to worry about
-	 * the other possible cases).
+	 * Validate the requested transform against the sensor capabilities and
+	 * rotation and store the final combined transform that configure() will
+	 * need to apply to the sensor to save us working it out again.
 	 */
-	if (!!(combined & Transform::Transpose)) {
-		/*
-		 * Flipping the transpose bit in "transform" flips it in the
-		 * combined result too (as it's the last thing that happens),
-		 * which is of course clearing it.
-		 */
-		transform ^= Transform::Transpose;
-		combined &= ~Transform::Transpose;
+	Transform requestedTransform = transform;
+	combinedTransform_ = data_->cio2_.sensor()->validateTransform(&transform);
+	if (transform != requestedTransform)
 		status = Adjusted;
-	}
-
-	/*
-	 * We also check if the sensor doesn't do h/vflips at all, in which
-	 * case we clear them, and the application will have to do everything.
-	 */
-	if (!data_->supportsFlips_ && !!combined) {
-		/*
-		 * If the sensor can do no transforms, then combined must be
-		 * changed to the identity. The only user transform that gives
-		 * rise to this is the inverse of the rotation. (Recall that
-		 * combined = transform * rotationTransform.)
-		 */
-		transform = -data_->rotationTransform_;
-		combined = Transform::Identity;
-		status = Adjusted;
-	}
-
-	/*
-	 * Store the final combined transform that configure() will need to
-	 * apply to the sensor to save us working it out again.
-	 */
-	combinedTransform_ = combined;
 
 	/* Cap the number of entries to the available streams. */
 	if (config_.size() > kMaxStreams) {
@@ -243,6 +211,7 @@ CameraConfiguration::Status IPU3CameraConfiguration::validate()
 	 */
 	unsigned int rawCount = 0;
 	unsigned int yuvCount = 0;
+	Size rawRequirement;
 	Size maxYuvSize;
 	Size rawSize;
 
@@ -251,10 +220,11 @@ CameraConfiguration::Status IPU3CameraConfiguration::validate()
 
 		if (info.colourEncoding == PixelFormatInfo::ColourEncodingRAW) {
 			rawCount++;
-			rawSize.expandTo(cfg.size);
+			rawSize = std::max(rawSize, cfg.size);
 		} else {
 			yuvCount++;
-			maxYuvSize.expandTo(cfg.size);
+			maxYuvSize = std::max(maxYuvSize, cfg.size);
+			rawRequirement.expandTo(cfg.size);
 		}
 	}
 
@@ -283,17 +253,17 @@ CameraConfiguration::Status IPU3CameraConfiguration::validate()
 	 * The output YUV streams will be limited in size to the maximum frame
 	 * size requested for the RAW stream, if present.
 	 *
-	 * If no raw stream is requested generate a size as large as the maximum
-	 * requested YUV size aligned to the ImgU constraints and bound by the
-	 * sensor's maximum resolution. See
+	 * If no raw stream is requested, generate a size from the largest YUV
+	 * stream, aligned to the ImgU constraints and bound
+	 * by the sensor's maximum resolution. See
 	 * https://bugs.libcamera.org/show_bug.cgi?id=32
 	 */
 	if (rawSize.isNull())
-		rawSize = maxYuvSize.expandedTo({ ImgUDevice::kIFMaxCropWidth,
-						  ImgUDevice::kIFMaxCropHeight })
-				    .grownBy({ ImgUDevice::kOutputMarginWidth,
-					       ImgUDevice::kOutputMarginHeight })
-				    .boundedTo(data_->cio2_.sensor()->resolution());
+		rawSize = rawRequirement.expandedTo({ ImgUDevice::kIFMaxCropWidth,
+						      ImgUDevice::kIFMaxCropHeight })
+				  .grownBy({ ImgUDevice::kOutputMarginWidth,
+					     ImgUDevice::kOutputMarginHeight })
+				  .boundedTo(data_->cio2_.sensor()->resolution());
 
 	cio2Configuration_ = data_->cio2_.generateConfiguration(rawSize);
 	if (!cio2Configuration_.pixelFormat.isValid())
@@ -420,11 +390,12 @@ PipelineHandlerIPU3::PipelineHandlerIPU3(CameraManager *manager)
 {
 }
 
-CameraConfiguration *PipelineHandlerIPU3::generateConfiguration(Camera *camera,
-								const StreamRoles &roles)
+std::unique_ptr<CameraConfiguration>
+PipelineHandlerIPU3::generateConfiguration(Camera *camera, const StreamRoles &roles)
 {
 	IPU3CameraData *data = cameraData(camera);
-	IPU3CameraConfiguration *config = new IPU3CameraConfiguration(data);
+	std::unique_ptr<IPU3CameraConfiguration> config =
+		std::make_unique<IPU3CameraConfiguration>(data);
 
 	if (roles.empty())
 		return config;
@@ -490,7 +461,6 @@ CameraConfiguration *PipelineHandlerIPU3::generateConfiguration(Camera *camera,
 		default:
 			LOG(IPU3, Error)
 				<< "Requested stream role not supported: " << role;
-			delete config;
 			return nullptr;
 		}
 
@@ -552,7 +522,7 @@ int PipelineHandlerIPU3::configure(Camera *camera, CameraConfiguration *c)
 		return ret;
 
 	/*
-	 * \todo: Enable links selectively based on the requested streams.
+	 * \todo Enable links selectively based on the requested streams.
 	 * As of now, enable all links unconditionally.
 	 * \todo Don't configure the ImgU at all if we only have a single
 	 * stream which is for raw capture, in which case no buffers will
@@ -568,31 +538,13 @@ int PipelineHandlerIPU3::configure(Camera *camera, CameraConfiguration *c)
 	 */
 	const Size &sensorSize = config->cio2Format().size;
 	V4L2DeviceFormat cio2Format;
-	ret = cio2->configure(sensorSize, &cio2Format);
+	ret = cio2->configure(sensorSize, config->combinedTransform_, &cio2Format);
 	if (ret)
 		return ret;
 
 	IPACameraSensorInfo sensorInfo;
 	cio2->sensor()->sensorInfo(&sensorInfo);
 	data->cropRegion_ = sensorInfo.analogCrop;
-
-	/*
-	 * Configure the H/V flip controls based on the combination of
-	 * the sensor and user transform.
-	 */
-	if (data->supportsFlips_) {
-		ControlList sensorCtrls(cio2->sensor()->controls());
-		sensorCtrls.set(V4L2_CID_HFLIP,
-				static_cast<int32_t>(!!(config->combinedTransform_
-							& Transform::HFlip)));
-		sensorCtrls.set(V4L2_CID_VFLIP,
-				static_cast<int32_t>(!!(config->combinedTransform_
-						        & Transform::VFlip)));
-
-		ret = cio2->sensor()->setControls(&sensorCtrls);
-		if (ret)
-			return ret;
-	}
 
 	/*
 	 * If the ImgU gets configured, its driver seems to expect that
@@ -1143,24 +1095,18 @@ int PipelineHandlerIPU3::registerCameras()
 						 &IPU3CameraData::frameStart);
 
 		/* Convert the sensor rotation to a transformation */
-		int32_t rotation = 0;
-		if (data->properties_.contains(properties::Rotation))
-			rotation = data->properties_.get(properties::Rotation);
-		else
+		const auto &rotation = data->properties_.get(properties::Rotation);
+		if (!rotation)
 			LOG(IPU3, Warning) << "Rotation control not exposed by "
 					   << cio2->sensor()->id()
 					   << ". Assume rotation 0";
 
+		int32_t rotationValue = rotation.value_or(0);
 		bool success;
-		data->rotationTransform_ = transformFromRotation(rotation, &success);
+		data->rotationTransform_ = transformFromRotation(rotationValue, &success);
 		if (!success)
-			LOG(IPU3, Warning) << "Invalid rotation of " << rotation
+			LOG(IPU3, Warning) << "Invalid rotation of " << rotationValue
 					   << " degrees: ignoring";
-
-		ControlList ctrls = cio2->sensor()->getControls({ V4L2_CID_HFLIP });
-		if (!ctrls.empty())
-			/* We assume the sensor supports VFLIP too. */
-			data->supportsFlips_ = true;
 
 		/**
 		 * \todo Dynamically assign ImgU and output devices to each
@@ -1244,8 +1190,16 @@ int IPU3CameraData::loadIPA()
 	if (ret)
 		return ret;
 
-	ret = ipa_->init(IPASettings{ "", sensor->model() }, sensorInfo,
-			 sensor->controls(), &ipaControls_);
+	/*
+	 * The API tuning file is made from the sensor name. If the tuning file
+	 * isn't found, fall back to the 'uncalibrated' file.
+	 */
+	std::string ipaTuningFile = ipa_->configurationFile(sensor->model() + ".yaml");
+	if (ipaTuningFile.empty())
+		ipaTuningFile = ipa_->configurationFile("uncalibrated.yaml");
+
+	ret = ipa_->init(IPASettings{ ipaTuningFile, sensor->model() },
+			 sensorInfo, sensor->controls(), &ipaControls_);
 	if (ret) {
 		LOG(IPU3, Error) << "Failed to initialise the IPU3 IPA";
 		return ret;
@@ -1289,6 +1243,8 @@ void IPU3CameraData::paramsBufferReady(unsigned int id)
 			imgu_->viewfinder_->queueBuffer(outbuffer);
 	}
 
+	info->paramBuffer->_d()->metadata().planes()[0].bytesused =
+		sizeof(struct ipu3_uapi_params);
 	imgu_->param_->queueBuffer(info->paramBuffer);
 	imgu_->stat_->queueBuffer(info->statBuffer);
 	imgu_->input_->queueBuffer(info->rawBuffer);
@@ -1330,8 +1286,9 @@ void IPU3CameraData::imguOutputBufferReady(FrameBuffer *buffer)
 
 	request->metadata().set(controls::draft::PipelineDepth, 3);
 	/* \todo Actually apply the scaler crop region to the ImgU. */
-	if (request->controls().contains(controls::ScalerCrop))
-		cropRegion_ = request->controls().get(controls::ScalerCrop);
+	const auto &scalerCrop = request->controls().get(controls::ScalerCrop);
+	if (scalerCrop)
+		cropRegion_ = *scalerCrop;
 	request->metadata().set(controls::ScalerCrop, cropRegion_);
 
 	if (frameInfos_.tryComplete(info))
@@ -1424,7 +1381,7 @@ void IPU3CameraData::statBufferReady(FrameBuffer *buffer)
 		return;
 	}
 
-	ipa_->processStatsBuffer(info->id, request->metadata().get(controls::SensorTimestamp),
+	ipa_->processStatsBuffer(info->id, request->metadata().get(controls::SensorTimestamp).value_or(0),
 				 info->statBuffer->cookie(), info->effectiveSensorControls);
 }
 
@@ -1449,20 +1406,18 @@ void IPU3CameraData::frameStart(uint32_t sequence)
 	/*
 	 * Handle controls to be set immediately on the next frame.
 	 * This currently only handle the TestPatternMode control.
-         *
+	 *
 	 * \todo Synchronize with the sequence number
 	 */
 	Request *request = processingRequests_.front();
 	processingRequests_.pop();
 
-	if (!request->controls().contains(controls::draft::TestPatternMode))
+	const auto &testPatternMode = request->controls().get(controls::draft::TestPatternMode);
+	if (!testPatternMode)
 		return;
 
-	const int32_t testPatternMode = request->controls().get(
-		controls::draft::TestPatternMode);
-
 	int ret = cio2_.sensor()->setTestPatternMode(
-		static_cast<controls::draft::TestPatternModeEnum>(testPatternMode));
+		static_cast<controls::draft::TestPatternModeEnum>(*testPatternMode));
 	if (ret) {
 		LOG(IPU3, Error) << "Failed to set test pattern mode: "
 				 << ret;
@@ -1470,7 +1425,7 @@ void IPU3CameraData::frameStart(uint32_t sequence)
 	}
 
 	request->metadata().set(controls::draft::TestPatternMode,
-				testPatternMode);
+				*testPatternMode);
 }
 
 REGISTER_PIPELINE_HANDLER(PipelineHandlerIPU3)

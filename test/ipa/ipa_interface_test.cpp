@@ -52,9 +52,9 @@ protected:
 		ipaManager_ = make_unique<IPAManager>();
 
 		/* Create a pipeline handler for vimc. */
-		std::vector<PipelineHandlerFactory *> &factories =
-			PipelineHandlerFactory::factories();
-		for (PipelineHandlerFactory *factory : factories) {
+		const std::vector<PipelineHandlerFactoryBase *> &factories =
+			PipelineHandlerFactoryBase::factories();
+		for (const PipelineHandlerFactoryBase *factory : factories) {
 			if (factory->name() == "PipelineHandlerVimc") {
 				pipe_ = factory->create(nullptr);
 				break;
@@ -106,7 +106,11 @@ protected:
 
 		/* Test initialization of IPA module. */
 		std::string conf = ipa_->configurationFile("vimc.conf");
-		int ret = ipa_->init(IPASettings{ conf, "vimc" });
+		Flags<ipa::vimc::TestFlag> inFlags;
+		Flags<ipa::vimc::TestFlag> outFlags;
+		int ret = ipa_->init(IPASettings{ conf, "vimc" },
+				     ipa::vimc::IPAOperationInit,
+				     inFlags, &outFlags);
 		if (ret < 0) {
 			cerr << "IPA interface init() failed" << endl;
 			return TestFail;

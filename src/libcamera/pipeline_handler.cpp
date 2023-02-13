@@ -8,6 +8,7 @@
 #include "libcamera/internal/pipeline_handler.h"
 
 #include <chrono>
+#include <sys/stat.h>
 #include <sys/sysmacros.h>
 
 #include <libcamera/base/log.h>
@@ -64,11 +65,10 @@ LOG_DEFINE_CATEGORY(Pipeline)
  *
  * In order to honour the std::enable_shared_from_this<> contract,
  * PipelineHandler instances shall never be constructed manually, but always
- * through the PipelineHandlerFactory::create() function implemented by the
- * respective factories.
+ * through the PipelineHandlerFactoryBase::create() function.
  */
 PipelineHandler::PipelineHandler(CameraManager *manager)
-	: manager_(manager), lockOwner_(false)
+	: manager_(manager), useCount_(0)
 {
 }
 
@@ -143,58 +143,89 @@ MediaDevice *PipelineHandler::acquireMediaDevice(DeviceEnumerator *enumerator,
 }
 
 /**
- * \brief Lock all media devices acquired by the pipeline
+ * \brief Acquire exclusive access to the pipeline handler for the process
  *
- * This function shall not be called from pipeline handler implementation, as
- * the Camera class handles locking directly.
+ * This function locks all the media devices used by the pipeline to ensure
+ * that no other process can access them concurrently.
+ *
+ * Access to a pipeline handler may be acquired recursively from within the
+ * same process. Every successful acquire() call shall be matched with a
+ * release() call. This allows concurrent access to the same pipeline handler
+ * from different cameras within the same process.
+ *
+ * Pipeline handlers shall not call this function directly as the Camera class
+ * handles access internally.
  *
  * \context This function is \threadsafe.
  *
- * \return True if the devices could be locked, false otherwise
- * \sa unlock()
- * \sa MediaDevice::lock()
+ * \return True if the pipeline handler was acquired, false if another process
+ * has already acquired it
+ * \sa release()
  */
-bool PipelineHandler::lock()
+bool PipelineHandler::acquire()
 {
 	MutexLocker locker(lock_);
 
-	/* Do not allow nested locking in the same libcamera instance. */
-	if (lockOwner_)
-		return false;
+	if (useCount_) {
+		++useCount_;
+		return true;
+	}
 
 	for (std::shared_ptr<MediaDevice> &media : mediaDevices_) {
 		if (!media->lock()) {
-			unlock();
+			unlockMediaDevices();
 			return false;
 		}
 	}
 
-	lockOwner_ = true;
-
+	++useCount_;
 	return true;
 }
 
 /**
- * \brief Unlock all media devices acquired by the pipeline
+ * \brief Release exclusive access to the pipeline handler
+ * \param[in] camera The camera for which to release data
  *
- * This function shall not be called from pipeline handler implementation, as
- * the Camera class handles locking directly.
+ * This function releases access to the pipeline handler previously acquired by
+ * a call to acquire(). Every release() call shall match a previous successful
+ * acquire() call. Calling this function on a pipeline handler that hasn't been
+ * acquired results in undefined behaviour.
+ *
+ * Pipeline handlers shall not call this function directly as the Camera class
+ * handles access internally.
  *
  * \context This function is \threadsafe.
  *
- * \sa lock()
+ * \sa acquire()
  */
-void PipelineHandler::unlock()
+void PipelineHandler::release(Camera *camera)
 {
 	MutexLocker locker(lock_);
 
-	if (!lockOwner_)
-		return;
+	ASSERT(useCount_);
 
+	unlockMediaDevices();
+
+	releaseDevice(camera);
+
+	--useCount_;
+}
+
+/**
+ * \brief Release resources associated with this camera
+ * \param[in] camera The camera for which to release resources
+ *
+ * Pipeline handlers may override this in order to perform cleanup operations
+ * when a camera is released, such as freeing memory.
+ */
+void PipelineHandler::releaseDevice([[maybe_unused]] Camera *camera)
+{
+}
+
+void PipelineHandler::unlockMediaDevices()
+{
 	for (std::shared_ptr<MediaDevice> &media : mediaDevices_)
 		media->unlock();
-
-	lockOwner_ = false;
 }
 
 /**
@@ -217,8 +248,7 @@ void PipelineHandler::unlock()
  * handler.
  *
  * \return A valid CameraConfiguration if the requested roles can be satisfied,
- * or a null pointer otherwise. The ownership of the returned configuration is
- * passed to the caller.
+ * or a null pointer otherwise.
  */
 
 /**
@@ -312,6 +342,8 @@ void PipelineHandler::stop(Camera *camera)
 	/* Make sure no requests are pending. */
 	Camera::Private *data = camera->_d();
 	ASSERT(data->queuedRequests_.empty());
+
+	data->requestSequence_ = 0;
 }
 
 /**
@@ -504,6 +536,62 @@ void PipelineHandler::completeRequest(Request *request)
 }
 
 /**
+ * \brief Retrieve the absolute path to a platform configuration file
+ * \param[in] subdir The pipeline handler specific subdirectory name
+ * \param[in] name The configuration file name
+ *
+ * This function locates a named platform configuration file and returns
+ * its absolute path to the pipeline handler. It searches the following
+ * directories, in order:
+ *
+ * - If libcamera is not installed, the src/libcamera/pipeline/\<subdir\>/data/
+ *   directory within the source tree ; otherwise
+ * - The system data (share/libcamera/pipeline/\<subdir\>) directory.
+ *
+ * The system directories are not searched if libcamera is not installed.
+ *
+ * \return The full path to the pipeline handler configuration file, or an empty
+ * string if no configuration file can be found
+ */
+std::string PipelineHandler::configurationFile(const std::string &subdir,
+					       const std::string &name) const
+{
+	std::string confPath;
+	struct stat statbuf;
+	int ret;
+
+	std::string root = utils::libcameraSourcePath();
+	if (!root.empty()) {
+		/*
+		 * When libcamera is used before it is installed, load
+		 * configuration files from the source directory. The
+		 * configuration files are then located in the 'data'
+		 * subdirectory of the corresponding pipeline handler.
+		 */
+		std::string confDir = root + "src/libcamera/pipeline/";
+		confPath = confDir + subdir + "/data/" + name;
+
+		LOG(Pipeline, Info)
+			<< "libcamera is not installed. Loading platform configuration file from '"
+			<< confPath << "'";
+	} else {
+		/* Else look in the system locations. */
+		confPath = std::string(LIBCAMERA_DATA_DIR)
+				+ "/pipeline/" + subdir + '/' + name;
+	}
+
+	ret = stat(confPath.c_str(), &statbuf);
+	if (ret == 0 && (statbuf.st_mode & S_IFMT) == S_IFREG)
+		return confPath;
+
+	LOG(Pipeline, Error)
+		<< "Configuration file '" << confPath
+		<< "' not found for pipeline handler '" << PipelineHandler::name() << "'";
+
+	return std::string();
+}
+
+/**
  * \brief Register a camera to the camera manager and pipeline handler
  * \param[in] camera The camera to be added
  *
@@ -597,7 +685,7 @@ void PipelineHandler::disconnect()
 	 */
 	std::vector<std::weak_ptr<Camera>> cameras{ std::move(cameras_) };
 
-	for (std::weak_ptr<Camera> ptr : cameras) {
+	for (const std::weak_ptr<Camera> &ptr : cameras) {
 		std::shared_ptr<Camera> camera = ptr.lock();
 		if (!camera)
 			continue;
@@ -624,27 +712,25 @@ void PipelineHandler::disconnect()
  */
 
 /**
- * \class PipelineHandlerFactory
- * \brief Registration of PipelineHandler classes and creation of instances
+ * \class PipelineHandlerFactoryBase
+ * \brief Base class for pipeline handler factories
  *
- * To facilitate discovery and instantiation of PipelineHandler classes, the
- * PipelineHandlerFactory class maintains a registry of pipeline handler
- * classes. Each PipelineHandler subclass shall register itself using the
- * REGISTER_PIPELINE_HANDLER() macro, which will create a corresponding
- * instance of a PipelineHandlerFactory subclass and register it with the
- * static list of factories.
+ * The PipelineHandlerFactoryBase class is the base of all specializations of
+ * the PipelineHandlerFactory class template. It implements the factory
+ * registration, maintains a registry of factories, and provides access to the
+ * registered factories.
  */
 
 /**
- * \brief Construct a pipeline handler factory
+ * \brief Construct a pipeline handler factory base
  * \param[in] name Name of the pipeline handler class
  *
- * Creating an instance of the factory registers is with the global list of
+ * Creating an instance of the factory base registers it with the global list of
  * factories, accessible through the factories() function.
  *
  * The factory \a name is used for debug purpose and shall be unique.
  */
-PipelineHandlerFactory::PipelineHandlerFactory(const char *name)
+PipelineHandlerFactoryBase::PipelineHandlerFactoryBase(const char *name)
 	: name_(name)
 {
 	registerType(this);
@@ -657,15 +743,15 @@ PipelineHandlerFactory::PipelineHandlerFactory(const char *name)
  * \return A shared pointer to a new instance of the PipelineHandler subclass
  * corresponding to the factory
  */
-std::shared_ptr<PipelineHandler> PipelineHandlerFactory::create(CameraManager *manager)
+std::shared_ptr<PipelineHandler> PipelineHandlerFactoryBase::create(CameraManager *manager) const
 {
-	PipelineHandler *handler = createInstance(manager);
+	std::unique_ptr<PipelineHandler> handler = createInstance(manager);
 	handler->name_ = name_.c_str();
-	return std::shared_ptr<PipelineHandler>(handler);
+	return std::shared_ptr<PipelineHandler>(std::move(handler));
 }
 
 /**
- * \fn PipelineHandlerFactory::name()
+ * \fn PipelineHandlerFactoryBase::name()
  * \brief Retrieve the factory name
  * \return The factory name
  */
@@ -677,9 +763,10 @@ std::shared_ptr<PipelineHandler> PipelineHandlerFactory::create(CameraManager *m
  * The caller is responsible to guarantee the uniqueness of the pipeline handler
  * name.
  */
-void PipelineHandlerFactory::registerType(PipelineHandlerFactory *factory)
+void PipelineHandlerFactoryBase::registerType(PipelineHandlerFactoryBase *factory)
 {
-	std::vector<PipelineHandlerFactory *> &factories = PipelineHandlerFactory::factories();
+	std::vector<PipelineHandlerFactoryBase *> &factories =
+		PipelineHandlerFactoryBase::factories();
 
 	factories.push_back(factory);
 }
@@ -688,28 +775,47 @@ void PipelineHandlerFactory::registerType(PipelineHandlerFactory *factory)
  * \brief Retrieve the list of all pipeline handler factories
  * \return the list of pipeline handler factories
  */
-std::vector<PipelineHandlerFactory *> &PipelineHandlerFactory::factories()
+std::vector<PipelineHandlerFactoryBase *> &PipelineHandlerFactoryBase::factories()
 {
 	/*
 	 * The static factories map is defined inside the function to ensure
 	 * it gets initialized on first use, without any dependency on
 	 * link order.
 	 */
-	static std::vector<PipelineHandlerFactory *> factories;
+	static std::vector<PipelineHandlerFactoryBase *> factories;
 	return factories;
 }
 
 /**
- * \fn PipelineHandlerFactory::createInstance()
+ * \class PipelineHandlerFactory
+ * \brief Registration of PipelineHandler classes and creation of instances
+ * \tparam _PipelineHandler The pipeline handler class type for this factory
+ *
+ * To facilitate discovery and instantiation of PipelineHandler classes, the
+ * PipelineHandlerFactory class implements auto-registration of pipeline
+ * handlers. Each PipelineHandler subclass shall register itself using the
+ * REGISTER_PIPELINE_HANDLER() macro, which will create a corresponding
+ * instance of a PipelineHandlerFactory and register it with the static list of
+ * factories.
+ */
+
+/**
+ * \fn PipelineHandlerFactory::PipelineHandlerFactory(const char *name)
+ * \brief Construct a pipeline handler factory
+ * \param[in] name Name of the pipeline handler class
+ *
+ * Creating an instance of the factory registers it with the global list of
+ * factories, accessible through the factories() function.
+ *
+ * The factory \a name is used for debug purpose and shall be unique.
+ */
+
+/**
+ * \fn PipelineHandlerFactory::createInstance() const
  * \brief Create an instance of the PipelineHandler corresponding to the factory
  * \param[in] manager The camera manager
- *
- * This virtual function is implemented by the REGISTER_PIPELINE_HANDLER()
- * macro. It creates a pipeline handler instance associated with the camera
- * \a manager.
- *
- * \return a pointer to a newly constructed instance of the PipelineHandler
- * subclass corresponding to the factory
+ * \return A unique pointer to a newly constructed instance of the
+ * PipelineHandler subclass corresponding to the factory
  */
 
 /**

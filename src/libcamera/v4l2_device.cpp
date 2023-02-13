@@ -24,6 +24,7 @@
 #include <libcamera/base/log.h>
 #include <libcamera/base/utils.h>
 
+#include "libcamera/internal/formats.h"
 #include "libcamera/internal/sysfs.h"
 
 /**
@@ -88,14 +89,13 @@ int V4L2Device::open(unsigned int flags)
 	UniqueFD fd(syscall(SYS_openat, AT_FDCWD, deviceNode_.c_str(), flags));
 	if (!fd.isValid()) {
 		int ret = -errno;
-		LOG(V4L2, Error) << "Failed to open V4L2 device: "
+		LOG(V4L2, Error) << "Failed to open V4L2 device '"
+				 << deviceNode_ << "': "
 				 << strerror(-ret);
 		return ret;
 	}
 
 	setFd(std::move(fd));
-
-	listControls();
 
 	return 0;
 }
@@ -126,6 +126,8 @@ int V4L2Device::setFd(UniqueFD fd)
 	fdEventNotifier_ = new EventNotifier(fd_.get(), EventNotifier::Exception);
 	fdEventNotifier_->activated.connect(this, &V4L2Device::eventAvailable);
 	fdEventNotifier_->setEnabled(false);
+
+	listControls();
 
 	return 0;
 }
@@ -242,7 +244,8 @@ ControlList V4L2Device::getControls(const std::vector<uint32_t> &ids)
 		}
 
 		/* A specific control failed. */
-		LOG(V4L2, Error) << "Unable to read control " << errorIdx
+		const unsigned int id = v4l2Ctrls[errorIdx].id;
+		LOG(V4L2, Error) << "Unable to read control " << utils::hex(id)
 				 << ": " << strerror(-ret);
 
 		v4l2Ctrls.resize(errorIdx);
@@ -352,7 +355,8 @@ int V4L2Device::setControls(ControlList *ctrls)
 		}
 
 		/* A specific control failed. */
-		LOG(V4L2, Error) << "Unable to set control " << errorIdx
+		const unsigned int id = v4l2Ctrls[errorIdx].id;
+		LOG(V4L2, Error) << "Unable to set control " << utils::hex(id)
 				 << ": " << strerror(-ret);
 
 		v4l2Ctrls.resize(errorIdx);
@@ -525,7 +529,7 @@ std::unique_ptr<ControlId> V4L2Device::v4l2ControlId(const v4l2_query_ext_ctrl &
  * \param[in] ctrl The v4l2_query_ext_ctrl that represents a V4L2 control
  * \return A ControlInfo that represents \a ctrl
  */
-ControlInfo V4L2Device::v4l2ControlInfo(const v4l2_query_ext_ctrl &ctrl)
+std::optional<ControlInfo> V4L2Device::v4l2ControlInfo(const v4l2_query_ext_ctrl &ctrl)
 {
 	switch (ctrl.type) {
 	case V4L2_CTRL_TYPE_U8:
@@ -562,14 +566,14 @@ ControlInfo V4L2Device::v4l2ControlInfo(const v4l2_query_ext_ctrl &ctrl)
  *
  * \return A ControlInfo that represents \a ctrl
  */
-ControlInfo V4L2Device::v4l2MenuControlInfo(const struct v4l2_query_ext_ctrl &ctrl)
+std::optional<ControlInfo> V4L2Device::v4l2MenuControlInfo(const struct v4l2_query_ext_ctrl &ctrl)
 {
 	std::vector<ControlValue> indices;
 	struct v4l2_querymenu menu = {};
 	menu.id = ctrl.id;
 
 	if (ctrl.minimum < 0)
-		return ControlInfo();
+		return std::nullopt;
 
 	for (int32_t index = ctrl.minimum; index <= ctrl.maximum; ++index) {
 		menu.index = index;
@@ -578,6 +582,14 @@ ControlInfo V4L2Device::v4l2MenuControlInfo(const struct v4l2_query_ext_ctrl &ct
 
 		indices.push_back(index);
 	}
+
+	/*
+	 * Some faulty UVC devices are known to return an empty menu control.
+	 * Controls without a menu option can not be set, or read, so they are
+	 * not exposed.
+	 */
+	if (indices.size() == 0)
+		return std::nullopt;
 
 	return ControlInfo(indices,
 			   ControlValue(static_cast<int32_t>(ctrl.default_value)));
@@ -627,7 +639,17 @@ void V4L2Device::listControls()
 		controlIdMap_[ctrl.id] = controlIds_.back().get();
 		controlInfo_.emplace(ctrl.id, ctrl);
 
-		ctrls.emplace(controlIds_.back().get(), v4l2ControlInfo(ctrl));
+		std::optional<ControlInfo> info = v4l2ControlInfo(ctrl);
+
+		if (!info) {
+			LOG(V4L2, Error)
+				<< "Control " << ctrl.name
+				<< " cannot be registered";
+
+			continue;
+		}
+
+		ctrls.emplace(controlIds_.back().get(), *info);
 	}
 
 	controls_ = ControlInfoMap(std::move(ctrls), controlIdMap_);
@@ -666,7 +688,7 @@ void V4L2Device::updateControlInfo()
 			continue;
 		}
 
-		info = v4l2ControlInfo(ctrl);
+		info = *v4l2ControlInfo(ctrl);
 	}
 }
 
@@ -745,8 +767,12 @@ void V4L2Device::eventAvailable()
 
 static const std::map<uint32_t, ColorSpace> v4l2ToColorSpace = {
 	{ V4L2_COLORSPACE_RAW, ColorSpace::Raw },
-	{ V4L2_COLORSPACE_JPEG, ColorSpace::Jpeg },
-	{ V4L2_COLORSPACE_SRGB, ColorSpace::Srgb },
+	{ V4L2_COLORSPACE_SRGB, {
+		ColorSpace::Primaries::Rec709,
+		ColorSpace::TransferFunction::Srgb,
+		ColorSpace::YcbcrEncoding::Rec601,
+		ColorSpace::Range::Limited } },
+	{ V4L2_COLORSPACE_JPEG, ColorSpace::Sycc },
 	{ V4L2_COLORSPACE_SMPTE170M, ColorSpace::Smpte170m },
 	{ V4L2_COLORSPACE_REC709, ColorSpace::Rec709 },
 	{ V4L2_COLORSPACE_BT2020, ColorSpace::Rec2020 },
@@ -771,8 +797,7 @@ static const std::map<uint32_t, ColorSpace::Range> v4l2ToRange = {
 
 static const std::vector<std::pair<ColorSpace, v4l2_colorspace>> colorSpaceToV4l2 = {
 	{ ColorSpace::Raw, V4L2_COLORSPACE_RAW },
-	{ ColorSpace::Jpeg, V4L2_COLORSPACE_JPEG },
-	{ ColorSpace::Srgb, V4L2_COLORSPACE_SRGB },
+	{ ColorSpace::Sycc, V4L2_COLORSPACE_JPEG },
 	{ ColorSpace::Smpte170m, V4L2_COLORSPACE_SMPTE170M },
 	{ ColorSpace::Rec709, V4L2_COLORSPACE_REC709 },
 	{ ColorSpace::Rec2020, V4L2_COLORSPACE_BT2020 },
@@ -792,6 +817,8 @@ static const std::map<ColorSpace::TransferFunction, v4l2_xfer_func> transferFunc
 };
 
 static const std::map<ColorSpace::YcbcrEncoding, v4l2_ycbcr_encoding> ycbcrEncodingToV4l2 = {
+	/* V4L2 has no "none" encoding. */
+	{ ColorSpace::YcbcrEncoding::None, V4L2_YCBCR_ENC_DEFAULT },
 	{ ColorSpace::YcbcrEncoding::Rec601, V4L2_YCBCR_ENC_601 },
 	{ ColorSpace::YcbcrEncoding::Rec709, V4L2_YCBCR_ENC_709 },
 	{ ColorSpace::YcbcrEncoding::Rec2020, V4L2_YCBCR_ENC_BT2020 },
@@ -805,6 +832,7 @@ static const std::map<ColorSpace::Range, v4l2_quantization> rangeToV4l2 = {
 /**
  * \brief Convert the color space fields in a V4L2 format to a ColorSpace
  * \param[in] v4l2Format A V4L2 format containing color space information
+ * \param[in] colourEncoding Type of colour encoding
  *
  * The colorspace, ycbcr_enc, xfer_func and quantization fields within a
  * V4L2 format structure are converted to a corresponding ColorSpace.
@@ -816,7 +844,8 @@ static const std::map<ColorSpace::Range, v4l2_quantization> rangeToV4l2 = {
  * \retval std::nullopt One or more V4L2 color space fields were not recognised
  */
 template<typename T>
-std::optional<ColorSpace> V4L2Device::toColorSpace(const T &v4l2Format)
+std::optional<ColorSpace> V4L2Device::toColorSpace(const T &v4l2Format,
+						   PixelFormatInfo::ColourEncoding colourEncoding)
 {
 	auto itColor = v4l2ToColorSpace.find(v4l2Format.colorspace);
 	if (itColor == v4l2ToColorSpace.end())
@@ -839,6 +868,14 @@ std::optional<ColorSpace> V4L2Device::toColorSpace(const T &v4l2Format)
 			return std::nullopt;
 
 		colorSpace.ycbcrEncoding = itYcbcrEncoding->second;
+
+		/*
+		 * V4L2 has no "none" encoding, override the value returned by
+		 * the kernel for non-YUV formats as YCbCr encoding isn't
+		 * applicable in that case.
+		 */
+		if (colourEncoding != PixelFormatInfo::ColourEncodingYUV)
+			colorSpace.ycbcrEncoding = ColorSpace::YcbcrEncoding::None;
 	}
 
 	if (v4l2Format.quantization != V4L2_QUANTIZATION_DEFAULT) {
@@ -847,14 +884,24 @@ std::optional<ColorSpace> V4L2Device::toColorSpace(const T &v4l2Format)
 			return std::nullopt;
 
 		colorSpace.range = itRange->second;
+
+		/*
+		 * "Limited" quantization range is only meant for YUV formats.
+		 * Override the range to "Full" for all other formats.
+		 */
+		if (colourEncoding != PixelFormatInfo::ColourEncodingYUV)
+			colorSpace.range = ColorSpace::Range::Full;
 	}
 
 	return colorSpace;
 }
 
-template std::optional<ColorSpace> V4L2Device::toColorSpace(const struct v4l2_pix_format &);
-template std::optional<ColorSpace> V4L2Device::toColorSpace(const struct v4l2_pix_format_mplane &);
-template std::optional<ColorSpace> V4L2Device::toColorSpace(const struct v4l2_mbus_framefmt &);
+template std::optional<ColorSpace> V4L2Device::toColorSpace(const struct v4l2_pix_format &,
+							    PixelFormatInfo::ColourEncoding);
+template std::optional<ColorSpace> V4L2Device::toColorSpace(const struct v4l2_pix_format_mplane &,
+							    PixelFormatInfo::ColourEncoding);
+template std::optional<ColorSpace> V4L2Device::toColorSpace(const struct v4l2_mbus_framefmt &,
+							    PixelFormatInfo::ColourEncoding);
 
 /**
  * \brief Fill in the color space fields of a V4L2 format from a ColorSpace

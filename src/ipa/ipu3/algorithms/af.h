@@ -30,9 +30,14 @@ public:
 	Af();
 	~Af() = default;
 
-	void prepare(IPAContext &context, ipu3_uapi_params *params) override;
 	int configure(IPAContext &context, const IPAConfigInfo &configInfo) override;
-	void process(IPAContext &context, const ipu3_uapi_stats_3a *stats) override;
+	void prepare(IPAContext &context, const uint32_t frame,
+		     IPAFrameContext &frameContext,
+		     ipu3_uapi_params *params) override;
+	void process(IPAContext &context, const uint32_t frame,
+		     IPAFrameContext &frameContext,
+		     const ipu3_uapi_stats_3a *stats,
+		     ControlList &metadata) override;
 
 private:
 	void afCoarseScan(IPAContext &context);
@@ -43,7 +48,7 @@ private:
 	void afIgnoreFrameReset();
 	double afEstimateVariance(Span<const y_table_item_t> y_items, bool isY1);
 
-	bool afIsOutOfFocus(IPAContext context);
+	bool afIsOutOfFocus(IPAContext &context);
 
 	/* VCM step configuration. It is the current setting of the VCM step. */
 	uint32_t focus_;

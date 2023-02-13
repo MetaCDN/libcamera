@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 /*
- * Copyright (C) 2020, Raspberry Pi (Trading) Limited
+ * Copyright (C) 2020, Raspberry Pi Ltd
  *
  * bayer_format.cpp - Class to represent Bayer formats
  */
@@ -191,6 +191,7 @@ const std::unordered_map<unsigned int, BayerFormat> mbusCodeToBayer{
 	{ MEDIA_BUS_FMT_SRGGB16_1X16, { BayerFormat::RGGB, 16, BayerFormat::Packing::None } },
 	{ MEDIA_BUS_FMT_Y8_1X8, { BayerFormat::MONO, 8, BayerFormat::Packing::None } },
 	{ MEDIA_BUS_FMT_Y10_1X10, { BayerFormat::MONO, 10, BayerFormat::Packing::None } },
+	{ MEDIA_BUS_FMT_Y12_1X12, { BayerFormat::MONO, 12, BayerFormat::Packing::None } },
 };
 
 } /* namespace */
@@ -355,11 +356,14 @@ BayerFormat BayerFormat::fromPixelFormat(PixelFormat format)
  * \brief Apply a transform to this BayerFormat
  * \param[in] t The transform to apply
  *
- * Appplying a transform to an image stored in a Bayer format affects the Bayer
- * order. For example, performing a horizontal flip on the Bayer pattern
- * RGGB causes the RG rows of pixels to become GR, and the GB rows to become BG.
- * The transformed image would have a GRBG order. The bit depth and modifiers
- * are not affected.
+ * Applying a transform to an image stored in a Bayer format affects the Bayer
+ * order. For example, performing a horizontal flip on the Bayer pattern RGGB
+ * causes the RG rows of pixels to become GR, and the GB rows to become BG. The
+ * transformed image would have a GRBG order. Performing a vertical flip on the
+ * Bayer pattern RGGB causes the GB rows to come before the RG ones and the
+ * transformed image would have GBRG order. Applying both vertical and
+ * horizontal flips on the Bayer patter RGGB results in transformed images with
+ * BGGR order. The bit depth and modifiers are not affected.
  *
  * Horizontal and vertical flips are applied before transpose.
  *
@@ -374,8 +378,11 @@ BayerFormat BayerFormat::transform(Transform t) const
 
 	/*
 	 * Observe that flipping bit 0 of the Order enum performs a horizontal
-	 * mirror on the Bayer pattern (e.g. RGGB goes to GRBG). Similarly,
-	 * flipping bit 1 performs a vertical mirror operation on it. Hence:
+	 * mirror on the Bayer pattern (e.g. RG/GB goes to GR/BG). Similarly,
+	 * flipping bit 1 performs a vertical mirror operation on it (e.g RG/GB
+	 * goes to GB/RG). Applying both vertical and horizontal flips
+	 * combines vertical and horizontal mirroring on the Bayer pattern
+	 * (e.g. RG/GB goes to BG/GR). Hence:
 	 */
 	if (!!(t & Transform::HFlip))
 		result.order = static_cast<Order>(result.order ^ 1);
