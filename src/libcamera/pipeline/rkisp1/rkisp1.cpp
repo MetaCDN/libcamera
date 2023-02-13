@@ -125,7 +125,6 @@ public:
 	Status validate() override;
 
 	const V4L2SubdeviceFormat &sensorFormat() { return sensorFormat_; }
-	const Transform &combinedTransform() { return combinedTransform_; }
 
 private:
 	bool fitsAllPaths(const StreamConfiguration &cfg);
@@ -139,7 +138,6 @@ private:
 	const RkISP1CameraData *data_;
 
 	V4L2SubdeviceFormat sensorFormat_;
-	Transform combinedTransform_;
 };
 
 class PipelineHandlerRkISP1 : public PipelineHandler
@@ -593,7 +591,7 @@ CameraConfiguration::Status RkISP1CameraConfiguration::validate()
 	if (sensorFormat_.size.isNull())
 		sensorFormat_.size = sensor->resolution();
 
-	combinedTransform_ = combined;
+	sensorFormat_.transform = combined;
 
 	return status;
 }
@@ -722,7 +720,7 @@ int PipelineHandlerRkISP1::configure(Camera *camera, CameraConfiguration *c)
 	V4L2SubdeviceFormat format = config->sensorFormat();
 	LOG(RkISP1, Debug) << "Configuring sensor with " << format;
 
-	ret = sensor->setFormat(&format, config->combinedTransform());
+	ret = sensor->setFormat(&format);
 	if (ret < 0)
 		return ret;
 

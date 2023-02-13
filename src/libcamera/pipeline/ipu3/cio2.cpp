@@ -194,7 +194,8 @@ int CIO2Device::configure(const Size &size, const Transform &transform,
 	 */
 	std::vector<unsigned int> mbusCodes = utils::map_keys(mbusCodesToPixelFormat);
 	sensorFormat = getSensorFormat(mbusCodes, size);
-	ret = sensor_->setFormat(&sensorFormat, transform);
+	sensorFormat.transform = transform;
+	ret = sensor_->setFormat(&sensorFormat);
 	if (ret)
 		return ret;
 

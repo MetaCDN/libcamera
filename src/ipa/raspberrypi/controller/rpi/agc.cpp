@@ -9,6 +9,8 @@
 #include <map>
 #include <tuple>
 
+#include <linux/bcm2835-isp.h>
+
 #include <libcamera/base/log.h>
 
 #include "../awb_status.h"
@@ -27,6 +29,8 @@ using namespace std::literals::chrono_literals;
 LOG_DEFINE_CATEGORY(RPiAgc)
 
 #define NAME "rpi.agc"
+
+static constexpr unsigned int PipelineBits = 13; /* seems to be a 13-bit pipeline */
 
 int AgcMeteringMode::read(const libcamera::YamlObject &params)
 {
@@ -447,7 +451,7 @@ void Agc::process(StatisticsPtr &stats, Metadata *imageMetadata)
 	fetchCurrentExposure(imageMetadata);
 	/* Compute the total gain we require relative to the current exposure. */
 	double gain, targetY;
-	computeGain(stats, imageMetadata, gain, targetY);
+	computeGain(stats.get(), imageMetadata, gain, targetY);
 	/* Now compute the target (final) exposure which we think we want. */
 	computeTargetExposure(gain);
 	/*
@@ -581,24 +585,24 @@ void Agc::fetchAwbStatus(Metadata *imageMetadata)
 		LOG(RPiAgc, Debug) << "No AWB status found";
 }
 
-static double computeInitialY(StatisticsPtr &stats, AwbStatus const &awb,
+static double computeInitialY(bcm2835_isp_stats *stats, AwbStatus const &awb,
 			      double weights[], double gain)
 {
-	constexpr unsigned int maxVal = 1 << Statistics::NormalisationFactorPow2;
+	bcm2835_isp_stats_region *regions = stats->agc_stats;
 	/*
 	 * Note how the calculation below means that equal weights give you
 	 * "average" metering (i.e. all pixels equally important).
 	 */
 	double rSum = 0, gSum = 0, bSum = 0, pixelSum = 0;
-	for (unsigned int i = 0; i < stats->agcRegions.numRegions(); i++) {
-		auto &region = stats->agcRegions.get(i);
-		double rAcc = std::min<double>(region.val.rSum * gain, (maxVal - 1) * region.counted);
-		double gAcc = std::min<double>(region.val.gSum * gain, (maxVal - 1) * region.counted);
-		double bAcc = std::min<double>(region.val.bSum * gain, (maxVal - 1) * region.counted);
+	for (unsigned int i = 0; i < AgcStatsSize; i++) {
+		double counted = regions[i].counted;
+		double rAcc = std::min(regions[i].r_sum * gain, ((1 << PipelineBits) - 1) * counted);
+		double gAcc = std::min(regions[i].g_sum * gain, ((1 << PipelineBits) - 1) * counted);
+		double bAcc = std::min(regions[i].b_sum * gain, ((1 << PipelineBits) - 1) * counted);
 		rSum += rAcc * weights[i];
 		gSum += gAcc * weights[i];
 		bSum += bAcc * weights[i];
-		pixelSum += region.counted * weights[i];
+		pixelSum += counted * weights[i];
 	}
 	if (pixelSum == 0.0) {
 		LOG(RPiAgc, Warning) << "computeInitialY: pixelSum is zero";
@@ -607,7 +611,7 @@ static double computeInitialY(StatisticsPtr &stats, AwbStatus const &awb,
 	double ySum = rSum * awb.gainR * .299 +
 		      gSum * awb.gainG * .587 +
 		      bSum * awb.gainB * .114;
-	return ySum / pixelSum / maxVal;
+	return ySum / pixelSum / (1 << PipelineBits);
 }
 
 /*
@@ -620,23 +624,23 @@ static double computeInitialY(StatisticsPtr &stats, AwbStatus const &awb,
 
 static constexpr double EvGainYTargetLimit = 0.9;
 
-static double constraintComputeGain(AgcConstraint &c, const Histogram &h, double lux,
+static double constraintComputeGain(AgcConstraint &c, Histogram &h, double lux,
 				    double evGain, double &targetY)
 {
 	targetY = c.yTarget.eval(c.yTarget.domain().clip(lux));
 	targetY = std::min(EvGainYTargetLimit, targetY * evGain);
 	double iqm = h.interQuantileMean(c.qLo, c.qHi);
-	return (targetY * h.bins()) / iqm;
+	return (targetY * NUM_HISTOGRAM_BINS) / iqm;
 }
 
-void Agc::computeGain(StatisticsPtr &statistics, Metadata *imageMetadata,
+void Agc::computeGain(bcm2835_isp_stats *statistics, Metadata *imageMetadata,
 		      double &gain, double &targetY)
 {
 	struct LuxStatus lux = {};
 	lux.lux = 400; /* default lux level to 400 in case no metadata found */
 	if (imageMetadata->get("lux.status", lux) != 0)
 		LOG(RPiAgc, Warning) << "No lux level found";
-	const Histogram &h = statistics->yHist;
+	Histogram h(statistics->hist[0].g_hist, NUM_HISTOGRAM_BINS);
 	double evGain = status_.ev * config_.baseEv;
 	/*
 	 * The initial gain and target_Y come from some of the regions. After

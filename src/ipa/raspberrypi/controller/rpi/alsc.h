@@ -12,7 +12,6 @@
 
 #include "../algorithm.h"
 #include "../alsc_status.h"
-#include "../statistics.h"
 
 namespace RPiController {
 
@@ -99,7 +98,7 @@ private:
 	/* copy out the results from the async thread so that it can be restarted */
 	void fetchAsyncResults();
 	double ct_;
-	RgbyRegions statistics_;
+	bcm2835_isp_stats_region statistics_[AlscCellsY * AlscCellsX];
 	double asyncResults_[3][AlscCellsY][AlscCellsX];
 	double asyncLambdaR_[AlscCellsX * AlscCellsY];
 	double asyncLambdaB_[AlscCellsX * AlscCellsY];

@@ -24,8 +24,6 @@
 #include "libcamera/internal/formats.h"
 #include "libcamera/internal/mapped_framebuffer.h"
 
-#include "../camera_buffer.h"
-
 using namespace libcamera;
 
 LOG_DECLARE_CATEGORY(JPEG)
@@ -180,20 +178,17 @@ void EncoderLibJpeg::compressNV(const std::vector<Span<uint8_t>> &planes)
 	}
 }
 
-int EncoderLibJpeg::encode(Camera3RequestDescriptor::StreamBuffer *buffer,
-			   libcamera::Span<const uint8_t> exifData,
-			   unsigned int quality)
+int EncoderLibJpeg::encode(const FrameBuffer &source, Span<uint8_t> dest,
+			   Span<const uint8_t> exifData, unsigned int quality)
 {
-	MappedFrameBuffer frame(buffer->srcBuffer,
-				MappedFrameBuffer::MapFlag::Read);
+	MappedFrameBuffer frame(&source, MappedFrameBuffer::MapFlag::Read);
 	if (!frame.isValid()) {
 		LOG(JPEG, Error) << "Failed to map FrameBuffer : "
 				 << strerror(frame.error());
 		return frame.error();
 	}
 
-	return encode(frame.planes(), buffer->dstBuffer->plane(0),
-		      exifData, quality);
+	return encode(frame.planes(), dest, exifData, quality);
 }
 
 int EncoderLibJpeg::encode(const std::vector<Span<uint8_t>> &src,

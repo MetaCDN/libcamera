@@ -20,11 +20,6 @@ namespace RPiController {
 class Histogram
 {
 public:
-	Histogram()
-	{
-		cumulative_.push_back(0);
-	}
-
 	template<typename T> Histogram(T *histogram, int num)
 	{
 		assert(num);

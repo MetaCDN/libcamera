@@ -20,7 +20,6 @@
 
 #include "../camera_device.h"
 #include "../frame_buffer_allocator.h"
-#include "../hal_framebuffer.h"
 
 using namespace libcamera;
 
@@ -80,7 +79,7 @@ public:
 
 	~Private() override;
 
-	std::unique_ptr<HALFrameBuffer>
+	std::unique_ptr<libcamera::FrameBuffer>
 	allocate(int halPixelFormat, const libcamera::Size &size, uint32_t usage);
 
 private:
@@ -95,7 +94,7 @@ PlatformFrameBufferAllocator::Private::~Private()
 		gralloc_close(allocDevice_);
 }
 
-std::unique_ptr<HALFrameBuffer>
+std::unique_ptr<libcamera::FrameBuffer>
 PlatformFrameBufferAllocator::Private::allocate(int halPixelFormat,
 						const libcamera::Size &size,
 						uint32_t usage)
@@ -138,10 +137,8 @@ PlatformFrameBufferAllocator::Private::allocate(int halPixelFormat,
 		offset += planeSize;
 	}
 
-	return std::make_unique<HALFrameBuffer>(
-		std::make_unique<GenericFrameBufferData>(
-			allocDevice_, handle, planes),
-		handle);
+	return std::make_unique<FrameBuffer>(
+		std::make_unique<GenericFrameBufferData>(allocDevice_, handle, planes));
 }
 
 PUBLIC_FRAME_BUFFER_ALLOCATOR_IMPLEMENTATION

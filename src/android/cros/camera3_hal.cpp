@@ -8,11 +8,9 @@
 #include <cros-camera/cros_camera_hal.h>
 
 #include "../camera_hal_manager.h"
-#include "../cros_mojo_token.h"
 
-static void set_up(cros::CameraMojoChannelManagerToken *token)
+static void set_up([[maybe_unused]] cros::CameraMojoChannelManagerToken *token)
 {
-	gCrosMojoToken = token;
 }
 
 static void tear_down()

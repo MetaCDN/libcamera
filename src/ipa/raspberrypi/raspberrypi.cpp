@@ -54,7 +54,6 @@
 #include "metadata.h"
 #include "sharpen_algorithm.h"
 #include "sharpen_status.h"
-#include "statistics.h"
 
 namespace libcamera {
 
@@ -153,7 +152,6 @@ private:
 	void prepareISP(const ISPConfig &data);
 	void reportMetadata(unsigned int ipaContext);
 	void fillDeviceStatus(const ControlList &sensorControls, unsigned int ipaContext);
-	RPiController::StatisticsPtr fillStatistics(bcm2835_isp_stats *stats) const;
 	void processStats(unsigned int bufferId, unsigned int ipaContext);
 	void applyFrameDurations(Duration minFrameDuration, Duration maxFrameDuration);
 	void applyAGC(const struct AgcStatus *agcStatus, ControlList &ctrls);
@@ -1366,52 +1364,6 @@ void IPARPi::fillDeviceStatus(const ControlList &sensorControls, unsigned int ip
 	rpiMetadata_[ipaContext].set("device.status", deviceStatus);
 }
 
-RPiController::StatisticsPtr IPARPi::fillStatistics(bcm2835_isp_stats *stats) const
-{
-	using namespace RPiController;
-
-	unsigned int i;
-	StatisticsPtr statistics =
-		std::make_unique<Statistics>(Statistics::AgcStatsPos::PreWb, Statistics::ColourStatsPos::PostLsc);
-
-	/* RGB histograms are not used, so do not populate them. */
-	statistics->yHist = RPiController::Histogram(stats->hist[0].g_hist, NUM_HISTOGRAM_BINS);
-
-	/*
-	 * All region sums are based on a 13-bit pipeline bit-depth. Normalise
-	 * this to 16-bits for the AGC/AWB/ALSC algorithms.
-	 */
-	constexpr unsigned int scale = Statistics::NormalisationFactorPow2 - 13;
-
-	statistics->awbRegions.init({ DEFAULT_AWB_REGIONS_X, DEFAULT_AWB_REGIONS_Y });
-	for (i = 0; i < statistics->awbRegions.numRegions(); i++)
-		statistics->awbRegions.set(i, { { stats->awb_stats[i].r_sum << scale,
-						  stats->awb_stats[i].g_sum << scale,
-						  stats->awb_stats[i].b_sum << scale },
-						stats->awb_stats[i].counted,
-						stats->awb_stats[i].notcounted });
-
-	/*
-	 * There are only ever 15 regions computed by the firmware due to zoning,
-	 * but the HW defines AGC_REGIONS == 16!
-	 */
-	statistics->agcRegions.init(15);
-	for (i = 0; i < statistics->agcRegions.numRegions(); i++)
-		statistics->agcRegions.set(i, { { stats->agc_stats[i].r_sum << scale,
-						  stats->agc_stats[i].g_sum << scale,
-						  stats->agc_stats[i].b_sum << scale },
-						stats->agc_stats[i].counted,
-						stats->awb_stats[i].notcounted });
-
-	statistics->focusRegions.init({ 4, 3 });
-	for (i = 0; i < statistics->focusRegions.numRegions(); i++)
-		statistics->focusRegions.set(i, { stats->focus_stats[i].contrast_val[1][1] / 1000,
-						  stats->focus_stats[i].contrast_val_num[1][1],
-						  stats->focus_stats[i].contrast_val_num[1][0] });
-
-	return statistics;
-}
-
 void IPARPi::processStats(unsigned int bufferId, unsigned int ipaContext)
 {
 	RPiController::Metadata &rpiMetadata = rpiMetadata_[ipaContext];
@@ -1424,7 +1376,7 @@ void IPARPi::processStats(unsigned int bufferId, unsigned int ipaContext)
 
 	Span<uint8_t> mem = it->second.planes()[0];
 	bcm2835_isp_stats *stats = reinterpret_cast<bcm2835_isp_stats *>(mem.data());
-	RPiController::StatisticsPtr statistics = fillStatistics(stats);
+	RPiController::StatisticsPtr statistics = std::make_shared<bcm2835_isp_stats>(*stats);
 	helper_->process(statistics, rpiMetadata);
 	controller_.process(statistics, &rpiMetadata);
 

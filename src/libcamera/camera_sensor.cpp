@@ -16,6 +16,7 @@
 #include <string.h>
 
 #include <libcamera/property_ids.h>
+#include <libcamera/transform.h>
 
 #include <libcamera/base/utils.h>
 
@@ -260,7 +261,7 @@ int CameraSensor::validateSensorDriver()
 		supportFlips_ = true;
 
 	if (!supportFlips_)
-		LOG(CameraSensor, Debug)
+		LOG(CameraSensor, Warning)
 			<< "Camera sensor does not support horizontal/vertical flip";
 
 	/*
@@ -750,6 +751,7 @@ V4L2SubdeviceFormat CameraSensor::getFormat(const std::vector<unsigned int> &mbu
 		.mbus_code = bestCode,
 		.size = *bestSize,
 		.colorSpace = ColorSpace::Raw,
+		.transform = Transform::Identity,
 	};
 
 	return format;
@@ -758,8 +760,6 @@ V4L2SubdeviceFormat CameraSensor::getFormat(const std::vector<unsigned int> &mbu
 /**
  * \brief Set the sensor output format
  * \param[in] format The desired sensor output format
- * \param[in] transform The transform to be applied on the sensor.
- * Defaults to Identity.
  *
  * If flips are writable they are configured according to the desired Transform.
  * Transform::Identity always corresponds to H/V flip being disabled if the
@@ -770,16 +770,18 @@ V4L2SubdeviceFormat CameraSensor::getFormat(const std::vector<unsigned int> &mbu
  *
  * \return 0 on success or a negative error code otherwise
  */
-int CameraSensor::setFormat(V4L2SubdeviceFormat *format, Transform transform)
+int CameraSensor::setFormat(V4L2SubdeviceFormat *format)
 {
 	/* Configure flips if the sensor supports that. */
 	if (supportFlips_) {
 		ControlList flipCtrls(subdev_->controls());
 
 		flipCtrls.set(V4L2_CID_HFLIP,
-			      static_cast<int32_t>(!!(transform & Transform::HFlip)));
+			      static_cast<int32_t>(!!(format->transform &
+						      Transform::HFlip)));
 		flipCtrls.set(V4L2_CID_VFLIP,
-			      static_cast<int32_t>(!!(transform & Transform::VFlip)));
+			      static_cast<int32_t>(!!(format->transform &
+						      Transform::VFlip)));
 
 		int ret = subdev_->setControls(&flipCtrls);
 		if (ret)
@@ -1021,8 +1023,8 @@ Transform CameraSensor::validateTransform(Transform *transform) const
 
 	/*
 	 * We combine the platform and user transform, but must "adjust away"
-	 * any combined result that includes a transposition, as we can't do
-	 * those. In this case, flipping only the transpose bit is helpful to
+	 * any combined result that includes a transform, as we can't do those.
+	 * In this case, flipping only the transpose bit is helpful to
 	 * applications - they either get the transform they requested, or have
 	 * to do a simple transpose themselves (they don't have to worry about
 	 * the other possible cases).

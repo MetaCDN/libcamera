@@ -13,9 +13,8 @@
 #include <libcamera/base/class.h>
 
 #include <libcamera/camera.h>
+#include <libcamera/framebuffer.h>
 #include <libcamera/geometry.h>
-
-#include "hal_framebuffer.h"
 
 class CameraDevice;
 
@@ -32,7 +31,7 @@ public:
 	 * Note: The returned FrameBuffer needs to be destroyed before
 	 * PlatformFrameBufferAllocator is destroyed.
 	 */
-	std::unique_ptr<HALFrameBuffer> allocate(
+	std::unique_ptr<libcamera::FrameBuffer> allocate(
 		int halPixelFormat, const libcamera::Size &size, uint32_t usage);
 };
 
@@ -45,7 +44,7 @@ PlatformFrameBufferAllocator::PlatformFrameBufferAllocator(		\
 PlatformFrameBufferAllocator::~PlatformFrameBufferAllocator()		\
 {									\
 }									\
-std::unique_ptr<HALFrameBuffer> 					\
+std::unique_ptr<libcamera::FrameBuffer>					\
 PlatformFrameBufferAllocator::allocate(int halPixelFormat,		\
 				       const libcamera::Size &size,	\
 				       uint32_t usage)			\

@@ -16,7 +16,6 @@
 
 #include "../camera_device.h"
 #include "../frame_buffer_allocator.h"
-#include "../hal_framebuffer.h"
 #include "cros-camera/camera_buffer_manager.h"
 
 using namespace libcamera;
@@ -49,11 +48,11 @@ public:
 	{
 	}
 
-	std::unique_ptr<HALFrameBuffer>
+	std::unique_ptr<libcamera::FrameBuffer>
 	allocate(int halPixelFormat, const libcamera::Size &size, uint32_t usage);
 };
 
-std::unique_ptr<HALFrameBuffer>
+std::unique_ptr<libcamera::FrameBuffer>
 PlatformFrameBufferAllocator::Private::allocate(int halPixelFormat,
 						const libcamera::Size &size,
 						uint32_t usage)
@@ -82,8 +81,8 @@ PlatformFrameBufferAllocator::Private::allocate(int halPixelFormat,
 		plane.length = cros::CameraBufferManager::GetPlaneSize(handle, i);
 	}
 
-	return std::make_unique<HALFrameBuffer>(
-		std::make_unique<CrosFrameBufferData>(std::move(scopedHandle), planes), handle);
+	return std::make_unique<FrameBuffer>(
+		std::make_unique<CrosFrameBufferData>(std::move(scopedHandle), planes));
 }
 
 PUBLIC_FRAME_BUFFER_ALLOCATOR_IMPLEMENTATION

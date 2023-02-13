@@ -22,7 +22,8 @@ public:
 	~EncoderLibJpeg();
 
 	int configure(const libcamera::StreamConfiguration &cfg) override;
-	int encode(Camera3RequestDescriptor::StreamBuffer *buffer,
+	int encode(const libcamera::FrameBuffer &source,
+		   libcamera::Span<uint8_t> destination,
 		   libcamera::Span<const uint8_t> exifData,
 		   unsigned int quality) override;
 	int encode(const std::vector<libcamera::Span<uint8_t>> &planes,
