@@ -170,6 +170,12 @@ public:
 	class iterator
 	{
 	public:
+		using difference_type = std::size_t;
+		using value_type = std::string;
+		using pointer = value_type *;
+		using reference = value_type &;
+		using iterator_category = std::input_iterator_tag;
+
 		iterator(const StringSplitter *ss, std::string::size_type pos);
 
 		iterator &operator++();
@@ -360,6 +366,8 @@ decltype(auto) abs_diff(const T &a, const T &b)
 	else
 		return a - b;
 }
+
+double strtod(const char *__restrict nptr, char **__restrict endptr);
 
 } /* namespace utils */
 

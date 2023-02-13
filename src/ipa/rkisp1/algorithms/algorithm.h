@@ -7,19 +7,25 @@
 
 #pragma once
 
-#include <linux/rkisp1-config.h>
-
-#include <libcamera/ipa/rkisp1_ipa_interface.h>
-
 #include <libipa/algorithm.h>
 
-#include "ipa_context.h"
+#include "module.h"
 
 namespace libcamera {
 
 namespace ipa::rkisp1 {
 
-using Algorithm = libcamera::ipa::Algorithm<IPAContext, IPACameraSensorInfo, rkisp1_params_cfg, rkisp1_stat_buffer>;
+class Algorithm : public libcamera::ipa::Algorithm<Module>
+{
+public:
+	Algorithm()
+		: disabled_(false), supportsRaw_(false)
+	{
+	}
+
+	bool disabled_;
+	bool supportsRaw_;
+};
 
 } /* namespace ipa::rkisp1 */
 

@@ -19,6 +19,9 @@ LIBCAMERA_LOG_LEVELS
 
    Example value: ``*:DEBUG``
 
+LIBCAMERA_LOG_NO_COLOR
+   Disable coloring of log messages (`more <Notes about debugging_>`__).
+
 LIBCAMERA_IPA_CONFIG_PATH
    Define custom search locations for IPA configurations (`more <IPA configuration_>`__).
 
@@ -34,18 +37,31 @@ LIBCAMERA_IPA_MODULE_PATH
 
    Example value: ``${HOME}/.libcamera/lib:/opt/libcamera/vendor/lib``
 
+LIBCAMERA_RPI_CONFIG_FILE
+   Define a custom configuration file to use in the Raspberry Pi pipeline handler.
+
+   Example value: ``/usr/local/share/libcamera/pipeline/raspberrypi/minimal_mem.yaml``
+
 Further details
 ---------------
 
 Notes about debugging
 ~~~~~~~~~~~~~~~~~~~~~
 
-The environment variables ``LIBCAMERA_LOG_FILE`` and ``LIBCAMERA_LOG_LEVELS``
-are used to modify the destination and verbosity of messages provided by
-libcamera.
+The environment variables ``LIBCAMERA_LOG_FILE``, ``LIBCAMERA_LOG_LEVELS`` and
+``LIBCAMERA_LOG_NO_COLOR`` are used to modify the default configuration of the
+libcamera logger.
 
-The ``LIBCAMERA_LOG_LEVELS`` variable accepts a comma-separated list of
-'category:level' pairs.
+By default, libcamera logs all messages to the standard error (std::cerr).
+Messages are colored by default depending on the log level. Coloring can be
+disabled by setting the ``LIBCAMERA_LOG_NO_COLOR`` environment variable.
+
+The default log destination can also be directed to a file by setting the
+``LIBCAMERA_LOG_FILE`` environment variable to the log file name. This also
+disables coloring.
+
+Log levels are controlled through the ``LIBCAMERA_LOG_LEVELS`` variable, which
+accepts a comma-separated list of 'category:level' pairs.
 
 The `level <Log levels_>`__ part is mandatory and can either be specified by
 name or by numerical index associated with each level.
@@ -76,7 +92,7 @@ global environment:
    :~$ cam --list
 
 Log levels
-~~~~~~~~~~~
+~~~~~~~~~~
 
 This is the list of available log levels, notice that all levels below
 the chosen one are printed, while those above are discarded.
@@ -92,7 +108,7 @@ If you choose WARN (2), you will be able to see WARN (2), ERROR (3) and FATAL (4
 but not DEBUG (0) and INFO (1).
 
 Log categories
-~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~~
 
 Every category represents a specific area of the libcamera codebase,
 the names can be located within the source code, for example:
@@ -130,7 +146,7 @@ storage locations to search for those configuration files.
 `Examples <https://git.libcamera.org/libcamera/libcamera.git/tree/src/ipa/raspberrypi/data>`__
 
 IPA module
-~~~~~~~~~~~
+~~~~~~~~~~
 
 In order to locate the correct IPA module for your hardware, libcamera gathers
 existing IPA modules from multiple locations. The default locations for this

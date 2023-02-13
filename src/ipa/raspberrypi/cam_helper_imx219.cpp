@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: BSD-2-Clause */
 /*
- * Copyright (C) 2019, Raspberry Pi (Trading) Limited
+ * Copyright (C) 2019, Raspberry Pi Ltd
  *
  * cam_helper_imx219.cpp - camera helper for imx219 sensor
  */
@@ -16,9 +16,9 @@
  */
 #define ENABLE_EMBEDDED_DATA 0
 
-#include "cam_helper.hpp"
+#include "cam_helper.h"
 #if ENABLE_EMBEDDED_DATA
-#include "md_parser.hpp"
+#include "md_parser.h"
 #endif
 
 using namespace RPiController;
@@ -32,17 +32,20 @@ constexpr uint32_t expHiReg = 0x15a;
 constexpr uint32_t expLoReg = 0x15b;
 constexpr uint32_t frameLengthHiReg = 0x160;
 constexpr uint32_t frameLengthLoReg = 0x161;
+constexpr uint32_t lineLengthHiReg = 0x162;
+constexpr uint32_t lineLengthLoReg = 0x163;
 constexpr std::initializer_list<uint32_t> registerList [[maybe_unused]]
-	= { expHiReg, expLoReg, gainReg, frameLengthHiReg, frameLengthLoReg };
+	= { expHiReg, expLoReg, gainReg, frameLengthHiReg, frameLengthLoReg,
+	    lineLengthHiReg, lineLengthLoReg };
 
 class CamHelperImx219 : public CamHelper
 {
 public:
 	CamHelperImx219();
-	uint32_t GainCode(double gain) const override;
-	double Gain(uint32_t gain_code) const override;
-	unsigned int MistrustFramesModeSwitch() const override;
-	bool SensorEmbeddedDataPresent() const override;
+	uint32_t gainCode(double gain) const override;
+	double gain(uint32_t gainCode) const override;
+	unsigned int mistrustFramesModeSwitch() const override;
+	bool sensorEmbeddedDataPresent() const override;
 
 private:
 	/*
@@ -51,7 +54,7 @@ private:
 	 */
 	static constexpr int frameIntegrationDiff = 4;
 
-	void PopulateMetadata(const MdParser::RegisterMap &registers,
+	void populateMetadata(const MdParser::RegisterMap &registers,
 			      Metadata &metadata) const override;
 };
 
@@ -64,17 +67,17 @@ CamHelperImx219::CamHelperImx219()
 {
 }
 
-uint32_t CamHelperImx219::GainCode(double gain) const
+uint32_t CamHelperImx219::gainCode(double gain) const
 {
 	return (uint32_t)(256 - 256 / gain);
 }
 
-double CamHelperImx219::Gain(uint32_t gain_code) const
+double CamHelperImx219::gain(uint32_t gainCode) const
 {
-	return 256.0 / (256 - gain_code);
+	return 256.0 / (256 - gainCode);
 }
 
-unsigned int CamHelperImx219::MistrustFramesModeSwitch() const
+unsigned int CamHelperImx219::mistrustFramesModeSwitch() const
 {
 	/*
 	 * For reasons unknown, we do occasionally get a bogus metadata frame
@@ -84,26 +87,29 @@ unsigned int CamHelperImx219::MistrustFramesModeSwitch() const
 	return 1;
 }
 
-bool CamHelperImx219::SensorEmbeddedDataPresent() const
+bool CamHelperImx219::sensorEmbeddedDataPresent() const
 {
 	return ENABLE_EMBEDDED_DATA;
 }
 
-void CamHelperImx219::PopulateMetadata(const MdParser::RegisterMap &registers,
+void CamHelperImx219::populateMetadata(const MdParser::RegisterMap &registers,
 				       Metadata &metadata) const
 {
 	DeviceStatus deviceStatus;
 
-	deviceStatus.shutter_speed = Exposure(registers.at(expHiReg) * 256 + registers.at(expLoReg));
-	deviceStatus.analogue_gain = Gain(registers.at(gainReg));
-	deviceStatus.frame_length = registers.at(frameLengthHiReg) * 256 + registers.at(frameLengthLoReg);
+	deviceStatus.lineLength = lineLengthPckToDuration(registers.at(lineLengthHiReg) * 256 +
+							  registers.at(lineLengthLoReg));
+	deviceStatus.shutterSpeed = exposure(registers.at(expHiReg) * 256 + registers.at(expLoReg),
+					     deviceStatus.lineLength);
+	deviceStatus.analogueGain = gain(registers.at(gainReg));
+	deviceStatus.frameLength = registers.at(frameLengthHiReg) * 256 + registers.at(frameLengthLoReg);
 
-	metadata.Set("device.status", deviceStatus);
+	metadata.set("device.status", deviceStatus);
 }
 
-static CamHelper *Create()
+static CamHelper *create()
 {
 	return new CamHelperImx219();
 }
 
-static RegisterCamHelper reg("imx219", &Create);
+static RegisterCamHelper reg("imx219", &create);

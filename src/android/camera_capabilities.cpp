@@ -31,13 +31,20 @@ namespace {
 
 /*
  * \var camera3Resolutions
- * \brief The list of image resolutions defined as mandatory to be supported by
- * the Android Camera3 specification
+ * \brief The list of image resolutions commonly supported by Android
+ *
+ * The following are defined as mandatory to be supported by the Android
+ * Camera3 specification: (320x240), (640x480), (1280x720), (1920x1080).
+ *
+ * The following 4:3 resolutions are defined as optional, but commonly
+ * supported by Android devices: (1280x960), (1600x1200).
  */
 const std::vector<Size> camera3Resolutions = {
 	{ 320, 240 },
 	{ 640, 480 },
 	{ 1280, 720 },
+	{ 1280, 960 },
+	{ 1600, 1200 },
 	{ 1920, 1080 }
 };
 
@@ -367,14 +374,20 @@ void CameraCapabilities::computeHwLevel(
 	camera_metadata_enum_android_info_supported_hardware_level
 		hwLevel = ANDROID_INFO_SUPPORTED_HARDWARE_LEVEL_FULL;
 
-	if (!caps.count(ANDROID_REQUEST_AVAILABLE_CAPABILITIES_MANUAL_SENSOR))
+	if (!caps.count(ANDROID_REQUEST_AVAILABLE_CAPABILITIES_MANUAL_SENSOR)) {
+		LOG(HAL, Info) << noFull << "missing manual sensor";
 		hwLevel = ANDROID_INFO_SUPPORTED_HARDWARE_LEVEL_LIMITED;
+	}
 
-	if (!caps.count(ANDROID_REQUEST_AVAILABLE_CAPABILITIES_MANUAL_POST_PROCESSING))
+	if (!caps.count(ANDROID_REQUEST_AVAILABLE_CAPABILITIES_MANUAL_POST_PROCESSING)) {
+		LOG(HAL, Info) << noFull << "missing manual post processing";
 		hwLevel = ANDROID_INFO_SUPPORTED_HARDWARE_LEVEL_LIMITED;
+	}
 
-	if (!caps.count(ANDROID_REQUEST_AVAILABLE_CAPABILITIES_BURST_CAPTURE))
+	if (!caps.count(ANDROID_REQUEST_AVAILABLE_CAPABILITIES_BURST_CAPTURE)) {
+		LOG(HAL, Info) << noFull << "missing burst capture";
 		hwLevel = ANDROID_INFO_SUPPORTED_HARDWARE_LEVEL_LIMITED;
+	}
 
 	found = staticMetadata_->getEntry(ANDROID_SYNC_MAX_LATENCY, &entry);
 	if (!found || *entry.data.i32 != 0) {
@@ -475,7 +488,7 @@ int CameraCapabilities::initializeStreamConfigurations()
 	 * \todo Get this from the camera properties once defined
 	 */
 	std::unique_ptr<CameraConfiguration> cameraConfig =
-		camera_->generateConfiguration({ StillCapture });
+		camera_->generateConfiguration({ StreamRole::StillCapture });
 	if (!cameraConfig) {
 		LOG(HAL, Error) << "Failed to get maximum resolution";
 		return -EINVAL;
@@ -492,8 +505,8 @@ int CameraCapabilities::initializeStreamConfigurations()
 	/*
 	 * Build the list of supported image resolutions.
 	 *
-	 * The resolutions listed in camera3Resolution are mandatory to be
-	 * supported, up to the camera maximum resolution.
+	 * The resolutions listed in camera3Resolution are supported, up to the
+	 * camera maximum resolution.
 	 *
 	 * Augment the list by adding resolutions calculated from the camera
 	 * maximum one.
@@ -686,6 +699,14 @@ int CameraCapabilities::initializeStreamConfigurations()
 				if (tolerance > 1.0)
 					minFrameDuration = minFrameDurationCap;
 			}
+
+			/*
+			 * Calculate FPS as CTS does and adjust the minimum
+			 * frame duration accordingly: see
+			 * Camera2SurfaceViewTestCase.java:getSuitableFpsRangeForDuration()
+			 */
+			minFrameDuration =
+				1e9 / static_cast<unsigned int>(floor(1e9 / minFrameDuration + 0.05f));
 
 			streamConfigurations_.push_back({
 				res, androidFormat, minFrameDuration, maxFrameDuration,
@@ -1042,18 +1063,18 @@ int CameraCapabilities::initializeStaticMetadata()
 	/* Sensor static metadata. */
 	std::array<int32_t, 2> pixelArraySize;
 	{
-		const Size &size = properties.get(properties::PixelArraySize);
+		const Size &size = properties.get(properties::PixelArraySize).value_or(Size{});
 		pixelArraySize[0] = size.width;
 		pixelArraySize[1] = size.height;
 		staticMetadata_->addEntry(ANDROID_SENSOR_INFO_PIXEL_ARRAY_SIZE,
 					  pixelArraySize);
 	}
 
-	if (properties.contains(properties::UnitCellSize)) {
-		const Size &cellSize = properties.get<Size>(properties::UnitCellSize);
+	const auto &cellSize = properties.get<Size>(properties::UnitCellSize);
+	if (cellSize) {
 		std::array<float, 2> physicalSize{
-			cellSize.width * pixelArraySize[0] / 1e6f,
-			cellSize.height * pixelArraySize[1] / 1e6f
+			cellSize->width * pixelArraySize[0] / 1e6f,
+			cellSize->height * pixelArraySize[1] / 1e6f
 		};
 		staticMetadata_->addEntry(ANDROID_SENSOR_INFO_PHYSICAL_SIZE,
 					  physicalSize);
@@ -1061,7 +1082,7 @@ int CameraCapabilities::initializeStaticMetadata()
 
 	{
 		const Span<const Rectangle> &rects =
-			properties.get(properties::PixelArrayActiveAreas);
+			properties.get(properties::PixelArrayActiveAreas).value_or(Span<const Rectangle>{});
 		std::vector<int32_t> data{
 			static_cast<int32_t>(rects[0].x),
 			static_cast<int32_t>(rects[0].y),
@@ -1079,11 +1100,10 @@ int CameraCapabilities::initializeStaticMetadata()
 				  sensitivityRange);
 
 	/* Report the color filter arrangement if the camera reports it. */
-	if (properties.contains(properties::draft::ColorFilterArrangement)) {
-		uint8_t filterArr = properties.get(properties::draft::ColorFilterArrangement);
+	const auto &filterArr = properties.get(properties::draft::ColorFilterArrangement);
+	if (filterArr)
 		staticMetadata_->addEntry(ANDROID_SENSOR_INFO_COLOR_FILTER_ARRANGEMENT,
-					  filterArr);
-	}
+					  *filterArr);
 
 	const auto &exposureInfo = controlsInfo.find(&controls::ExposureTime);
 	if (exposureInfo != controlsInfo.end()) {
@@ -1287,12 +1307,10 @@ int CameraCapabilities::initializeStaticMetadata()
 		 * recording profile. Inspecting the Intel IPU3 HAL
 		 * implementation confirms this but no reference has been found
 		 * in the metadata documentation.
-		 *
-		 * Calculate FPS as CTS does: see
-		 * Camera2SurfaceViewTestCase.java:getSuitableFpsRangeForDuration()
 		 */
-		unsigned int fps = static_cast<unsigned int>
-				   (floor(1e9 / entry.minFrameDurationNsec + 0.05f));
+		unsigned int fps =
+			static_cast<unsigned int>(floor(1e9 / entry.minFrameDurationNsec));
+
 		if (entry.androidFormat != HAL_PIXEL_FORMAT_BLOB && fps < 30)
 			continue;
 

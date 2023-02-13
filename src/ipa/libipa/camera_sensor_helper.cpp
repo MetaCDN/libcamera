@@ -43,7 +43,8 @@ namespace ipa {
  * \brief Construct a CameraSensorHelper instance
  *
  * CameraSensorHelper derived class instances shall never be constructed
- * manually but always through the CameraSensorHelperFactory::create() function.
+ * manually but always through the CameraSensorHelperFactoryBase::create()
+ * function.
  */
 
 /**
@@ -154,7 +155,7 @@ double CameraSensorHelper::gain(uint32_t gainCode) const
  * through the 'm' coefficient.
  *
  * When the gain is expressed in dB, 'a' is equal to 1 and 'm' to
- * \f$log_{2}{10^{frac{1}{20}}}\f$.
+ * \f$log_{2}{10^{\frac{1}{20}}}\f$.
  */
 
 /**
@@ -217,27 +218,25 @@ double CameraSensorHelper::gain(uint32_t gainCode) const
  */
 
 /**
- * \class CameraSensorHelperFactory
- * \brief Registration of CameraSensorHelperFactory classes and creation of instances
+ * \class CameraSensorHelperFactoryBase
+ * \brief Base class for camera sensor helper factories
  *
- * To facilitate discovery and instantiation of CameraSensorHelper classes, the
- * CameraSensorHelperFactory class maintains a registry of camera sensor helper
- * sub-classes. Each CameraSensorHelper subclass shall register itself using the
- * REGISTER_CAMERA_SENSOR_HELPER() macro, which will create a corresponding
- * instance of a CameraSensorHelperFactory subclass and register it with the
- * static list of factories.
+ * The CameraSensorHelperFactoryBase class is the base of all specializations of
+ * the CameraSensorHelperFactory class template. It implements the factory
+ * registration, maintains a registry of factories, and provides access to the
+ * registered factories.
  */
 
 /**
- * \brief Construct a camera sensor helper factory
+ * \brief Construct a camera sensor helper factory base
  * \param[in] name Name of the camera sensor helper class
  *
- * Creating an instance of the factory registers it with the global list of
+ * Creating an instance of the factory base registers it with the global list of
  * factories, accessible through the factories() function.
  *
- * The factory \a name is used for debug purpose and shall be unique.
+ * The factory \a name is used to look up factories and shall be unique.
  */
-CameraSensorHelperFactory::CameraSensorHelperFactory(const std::string name)
+CameraSensorHelperFactoryBase::CameraSensorHelperFactoryBase(const std::string name)
 	: name_(name)
 {
 	registerType(this);
@@ -252,17 +251,16 @@ CameraSensorHelperFactory::CameraSensorHelperFactory(const std::string name)
  * corresponding to the named factory or a null pointer if no such factory
  * exists
  */
-std::unique_ptr<CameraSensorHelper> CameraSensorHelperFactory::create(const std::string &name)
+std::unique_ptr<CameraSensorHelper> CameraSensorHelperFactoryBase::create(const std::string &name)
 {
-	std::vector<CameraSensorHelperFactory *> &factories =
-		CameraSensorHelperFactory::factories();
+	const std::vector<CameraSensorHelperFactoryBase *> &factories =
+		CameraSensorHelperFactoryBase::factories();
 
-	for (CameraSensorHelperFactory *factory : factories) {
+	for (const CameraSensorHelperFactoryBase *factory : factories) {
 		if (name != factory->name_)
 			continue;
 
-		CameraSensorHelper *helper = factory->createInstance();
-		return std::unique_ptr<CameraSensorHelper>(helper);
+		return factory->createInstance();
 	}
 
 	return nullptr;
@@ -275,10 +273,10 @@ std::unique_ptr<CameraSensorHelper> CameraSensorHelperFactory::create(const std:
  * The caller is responsible to guarantee the uniqueness of the camera sensor
  * helper name.
  */
-void CameraSensorHelperFactory::registerType(CameraSensorHelperFactory *factory)
+void CameraSensorHelperFactoryBase::registerType(CameraSensorHelperFactoryBase *factory)
 {
-	std::vector<CameraSensorHelperFactory *> &factories =
-		CameraSensorHelperFactory::factories();
+	std::vector<CameraSensorHelperFactoryBase *> &factories =
+		CameraSensorHelperFactoryBase::factories();
 
 	factories.push_back(factory);
 }
@@ -287,33 +285,49 @@ void CameraSensorHelperFactory::registerType(CameraSensorHelperFactory *factory)
  * \brief Retrieve the list of all camera sensor helper factories
  * \return The list of camera sensor helper factories
  */
-std::vector<CameraSensorHelperFactory *> &CameraSensorHelperFactory::factories()
+std::vector<CameraSensorHelperFactoryBase *> &CameraSensorHelperFactoryBase::factories()
 {
 	/*
 	 * The static factories map is defined inside the function to ensure
 	 * it gets initialized on first use, without any dependency on link
 	 * order.
 	 */
-	static std::vector<CameraSensorHelperFactory *> factories;
+	static std::vector<CameraSensorHelperFactoryBase *> factories;
 	return factories;
 }
 
 /**
- * \fn CameraSensorHelperFactory::createInstance()
- * \brief Create an instance of the CameraSensorHelper corresponding to the
- * factory
+ * \class CameraSensorHelperFactory
+ * \brief Registration of CameraSensorHelperFactory classes and creation of instances
+ * \tparam _Helper The camera sensor helper class type for this factory
  *
- * This virtual function is implemented by the REGISTER_CAMERA_SENSOR_HELPER()
- * macro. It creates a camera sensor helper instance associated with the camera
- * sensor model.
- *
- * \return A pointer to a newly constructed instance of the CameraSensorHelper
- * subclass corresponding to the factory
+ * To facilitate discovery and instantiation of CameraSensorHelper classes, the
+ * CameraSensorHelperFactory class implements auto-registration of camera sensor
+ * helpers. Each CameraSensorHelper subclass shall register itself using the
+ * REGISTER_CAMERA_SENSOR_HELPER() macro, which will create a corresponding
+ * instance of a CameraSensorHelperFactory subclass and register it with the
+ * static list of factories.
  */
 
 /**
- * \var CameraSensorHelperFactory::name_
- * \brief The name of the factory
+ * \fn CameraSensorHelperFactory::CameraSensorHelperFactory(const char *name)
+ * \brief Construct a camera sensor helper factory
+ * \param[in] name Name of the camera sensor helper class
+ *
+ * Creating an instance of the factory registers it with the global list of
+ * factories, accessible through the CameraSensorHelperFactoryBase::factories()
+ * function.
+ *
+ * The factory \a name is used to look up factories and shall be unique.
+ */
+
+/**
+ * \fn CameraSensorHelperFactory::createInstance() const
+ * \brief Create an instance of the CameraSensorHelper corresponding to the
+ * factory
+ *
+ * \return A unique pointer to a newly constructed instance of the
+ * CameraSensorHelper subclass corresponding to the factory
  */
 
 /**
@@ -351,6 +365,35 @@ static constexpr double expGainDb(double step)
 	 */
 	return log2_10 * step / 20;
 }
+
+class CameraSensorHelperAr0521 : public CameraSensorHelper
+{
+public:
+	uint32_t gainCode(double gain) const override;
+	double gain(uint32_t gainCode) const override;
+
+private:
+	static constexpr double kStep_ = 16;
+};
+
+uint32_t CameraSensorHelperAr0521::gainCode(double gain) const
+{
+	gain = std::clamp(gain, 1.0, 15.5);
+	unsigned int coarse = std::log2(gain);
+	unsigned int fine = (gain / (1 << coarse) - 1) * kStep_;
+
+	return (coarse << 4) | (fine & 0xf);
+}
+
+double CameraSensorHelperAr0521::gain(uint32_t gainCode) const
+{
+	unsigned int coarse = gainCode >> 4;
+	unsigned int fine = gainCode & 0xf;
+
+	return (1 << coarse) * (1 + fine / kStep_);
+}
+
+REGISTER_CAMERA_SENSOR_HELPER("ar0521", CameraSensorHelperAr0521)
 
 class CameraSensorHelperImx219 : public CameraSensorHelper
 {
@@ -396,6 +439,17 @@ public:
 };
 REGISTER_CAMERA_SENSOR_HELPER("imx296", CameraSensorHelperImx296)
 
+class CameraSensorHelperImx477 : public CameraSensorHelper
+{
+public:
+	CameraSensorHelperImx477()
+	{
+		gainType_ = AnalogueGainLinear;
+		gainConstants_.linear = { 0, 1024, -1, 1024 };
+	}
+};
+REGISTER_CAMERA_SENSOR_HELPER("imx477", CameraSensorHelperImx477)
+
 class CameraSensorHelperOv2740 : public CameraSensorHelper
 {
 public:
@@ -406,6 +460,17 @@ public:
 	}
 };
 REGISTER_CAMERA_SENSOR_HELPER("ov2740", CameraSensorHelperOv2740)
+
+class CameraSensorHelperOv4689 : public CameraSensorHelper
+{
+public:
+	CameraSensorHelperOv4689()
+	{
+		gainType_ = AnalogueGainLinear;
+		gainConstants_.linear = { 1, 0, 0, 128 };
+	}
+};
+REGISTER_CAMERA_SENSOR_HELPER("ov4689", CameraSensorHelperOv4689)
 
 class CameraSensorHelperOv5640 : public CameraSensorHelper
 {
@@ -429,6 +494,17 @@ public:
 };
 REGISTER_CAMERA_SENSOR_HELPER("ov5670", CameraSensorHelperOv5670)
 
+class CameraSensorHelperOv5675 : public CameraSensorHelper
+{
+public:
+	CameraSensorHelperOv5675()
+	{
+		gainType_ = AnalogueGainLinear;
+		gainConstants_.linear = { 1, 0, 0, 128 };
+	}
+};
+REGISTER_CAMERA_SENSOR_HELPER("ov5675", CameraSensorHelperOv5675)
+
 class CameraSensorHelperOv5693 : public CameraSensorHelper
 {
 public:
@@ -439,6 +515,24 @@ public:
 	}
 };
 REGISTER_CAMERA_SENSOR_HELPER("ov5693", CameraSensorHelperOv5693)
+
+class CameraSensorHelperOv8858 : public CameraSensorHelper
+{
+public:
+	CameraSensorHelperOv8858()
+	{
+		gainType_ = AnalogueGainLinear;
+
+		/*
+		 * \todo Validate the selected 1/128 step value as it differs
+		 * from what the sensor manual describes.
+		 *
+		 * See: https://patchwork.linuxtv.org/project/linux-media/patch/20221106171129.166892-2-nicholas@rothemail.net/#142267
+		 */
+		gainConstants_.linear = { 1, 0, 0, 128 };
+	}
+};
+REGISTER_CAMERA_SENSOR_HELPER("ov8858", CameraSensorHelperOv8858)
 
 class CameraSensorHelperOv8865 : public CameraSensorHelper
 {

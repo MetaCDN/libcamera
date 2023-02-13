@@ -158,9 +158,12 @@ void Request::Private::cancel()
 }
 
 /**
- * \copydoc Request::reuse()
+ * \brief Reset the request internal data to default values
+ *
+ * After calling this function, all request internal data will have default
+ * values as if the Request::Private instance had just been constructed.
  */
-void Request::Private::reuse()
+void Request::Private::reset()
 {
 	sequence_ = 0;
 	cancelled_ = false;
@@ -349,7 +352,7 @@ Request::Request(Camera *camera, uint64_t cookie)
 				    camera->_d()->validator());
 
 	/**
-	 * \todo: Add a validator for metadata controls.
+	 * \todo Add a validator for metadata controls.
 	 */
 	metadata_ = new ControlList(controls::controls);
 
@@ -380,7 +383,7 @@ void Request::reuse(ReuseFlag flags)
 {
 	LIBCAMERA_TRACEPOINT(request_reuse, this);
 
-	_d()->reuse();
+	_d()->reset();
 
 	if (flags & ReuseBuffers) {
 		for (auto pair : bufferMap_) {
@@ -526,8 +529,8 @@ FrameBuffer *Request::findBuffer(const Stream *stream) const
  *
  * When requests are queued, they are given a sequential number to track the
  * order in which requests are queued to a camera. This number counts all
- * requests given to a camera through its lifetime, and is not reset to zero
- * between camera stop/start sequences.
+ * requests given to a camera and is reset to zero between camera stop/start
+ * sequences.
  *
  * It can be used to support debugging and identifying the flow of requests
  * through a pipeline, but does not guarantee to represent the sequence number
@@ -582,16 +585,28 @@ bool Request::hasPendingBuffers() const
 std::string Request::toString() const
 {
 	std::stringstream ss;
+	ss << *this;
 
+	return ss.str();
+}
+
+/**
+ * \brief Insert a text representation of a Request into an output stream
+ * \param[in] out The output stream
+ * \param[in] r The Request
+ * \return The output stream \a out
+ */
+std::ostream &operator<<(std::ostream &out, const Request &r)
+{
 	/* Pending, Completed, Cancelled(X). */
 	static const char *statuses = "PCX";
 
 	/* Example Output: Request(55:P:1/2:6523524) */
-	ss << "Request(" << sequence() << ":" << statuses[status_] << ":"
-	   << _d()->pending_.size() << "/" << bufferMap_.size() << ":"
-	   << cookie_ << ")";
+	out << "Request(" << r.sequence() << ":" << statuses[r.status()] << ":"
+	    << r._d()->pending_.size() << "/" << r.buffers().size() << ":"
+	    << r.cookie() << ")";
 
-	return ss.str();
+	return out;
 }
 
 } /* namespace libcamera */

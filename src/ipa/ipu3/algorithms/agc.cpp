@@ -14,6 +14,7 @@
 #include <libcamera/base/log.h>
 #include <libcamera/base/utils.h>
 
+#include <libcamera/control_ids.h>
 #include <libcamera/ipa/core_ipa_interface.h>
 
 #include "libipa/histogram.h"
@@ -87,7 +88,7 @@ int Agc::configure(IPAContext &context,
 		   [[maybe_unused]] const IPAConfigInfo &configInfo)
 {
 	const IPASessionConfiguration &configuration = context.configuration;
-	IPAFrameContext &frameContext = context.frameContext;
+	IPAActiveState &activeState = context.activeState;
 
 	stride_ = configuration.grid.stride;
 
@@ -99,8 +100,8 @@ int Agc::configure(IPAContext &context,
 	maxAnalogueGain_ = std::min(configuration.agc.maxAnalogueGain, kMaxAnalogueGain);
 
 	/* Configure the default exposure and gain. */
-	frameContext.agc.gain = std::max(minAnalogueGain_, kMinAnalogueGain);
-	frameContext.agc.exposure = 10ms / configuration.sensor.lineDuration;
+	activeState.agc.gain = std::max(minAnalogueGain_, kMinAnalogueGain);
+	activeState.agc.exposure = 10ms / configuration.sensor.lineDuration;
 
 	frameCount_ = 0;
 	return 0;
@@ -183,11 +184,10 @@ utils::Duration Agc::filterExposure(utils::Duration exposureValue)
  * \param[in] yGain The gain calculated based on the relative luminance target
  * \param[in] iqMeanGain The gain calculated based on the relative luminance target
  */
-void Agc::computeExposure(IPAContext &context, double yGain,
-			  double iqMeanGain)
+void Agc::computeExposure(IPAContext &context, IPAFrameContext &frameContext,
+			  double yGain, double iqMeanGain)
 {
 	const IPASessionConfiguration &configuration = context.configuration;
-	IPAFrameContext &frameContext = context.frameContext;
 	/* Get the effective exposure and gain applied on the sensor. */
 	uint32_t exposure = frameContext.sensor.exposure;
 	double analogueGain = frameContext.sensor.gain;
@@ -230,7 +230,7 @@ void Agc::computeExposure(IPAContext &context, double yGain,
 
 	/*
 	 * Filter the exposure.
-	 * \todo: estimate if we need to desaturate
+	 * \todo estimate if we need to desaturate
 	 */
 	exposureValue = filterExposure(exposureValue);
 
@@ -249,9 +249,10 @@ void Agc::computeExposure(IPAContext &context, double yGain,
 			    << shutterTime << " and "
 			    << stepGain;
 
+	IPAActiveState &activeState = context.activeState;
 	/* Update the estimated exposure and gain. */
-	frameContext.agc.exposure = shutterTime / configuration.sensor.lineDuration;
-	frameContext.agc.gain = stepGain;
+	activeState.agc.exposure = shutterTime / configuration.sensor.lineDuration;
+	activeState.agc.gain = stepGain;
 }
 
 /**
@@ -279,7 +280,7 @@ void Agc::computeExposure(IPAContext &context, double yGain,
  * More detailed information can be found in:
  * https://en.wikipedia.org/wiki/Relative_luminance
  */
-double Agc::estimateLuminance(IPAFrameContext &frameContext,
+double Agc::estimateLuminance(IPAActiveState &activeState,
 			      const ipu3_uapi_grid_config &grid,
 			      const ipu3_uapi_stats_3a *stats,
 			      double gain)
@@ -307,9 +308,9 @@ double Agc::estimateLuminance(IPAFrameContext &frameContext,
 	 * Apply the AWB gains to approximate colours correctly, use the Rec.
 	 * 601 formula to calculate the relative luminance, and normalize it.
 	 */
-	double ySum = redSum * frameContext.awb.gains.red * 0.299
-		    + greenSum * frameContext.awb.gains.green * 0.587
-		    + blueSum * frameContext.awb.gains.blue * 0.114;
+	double ySum = redSum * activeState.awb.gains.red * 0.299
+		    + greenSum * activeState.awb.gains.green * 0.587
+		    + blueSum * activeState.awb.gains.blue * 0.114;
 
 	return ySum / (grid.height * grid.width) / 255;
 }
@@ -317,12 +318,18 @@ double Agc::estimateLuminance(IPAFrameContext &frameContext,
 /**
  * \brief Process IPU3 statistics, and run AGC operations
  * \param[in] context The shared IPA context
+ * \param[in] frame The current frame sequence number
+ * \param[in] frameContext The current frame context
  * \param[in] stats The IPU3 statistics and ISP results
+ * \param[out] metadata Metadata for the frame, to be filled by the algorithm
  *
  * Identify the current image brightness, and use that to estimate the optimal
  * new exposure and gain for the scene.
  */
-void Agc::process(IPAContext &context, const ipu3_uapi_stats_3a *stats)
+void Agc::process(IPAContext &context, [[maybe_unused]] const uint32_t frame,
+		  IPAFrameContext &frameContext,
+		  const ipu3_uapi_stats_3a *stats,
+		  ControlList &metadata)
 {
 	/*
 	 * Estimate the gain needed to have the proportion of pixels in a given
@@ -344,7 +351,7 @@ void Agc::process(IPAContext &context, const ipu3_uapi_stats_3a *stats)
 	double yTarget = kRelativeLuminanceTarget;
 
 	for (unsigned int i = 0; i < 8; i++) {
-		double yValue = estimateLuminance(context.frameContext,
+		double yValue = estimateLuminance(context.activeState,
 						  context.configuration.grid.bdsGrid,
 						  stats, yGain);
 		double extraGain = std::min(10.0, yTarget / (yValue + .001));
@@ -357,9 +364,24 @@ void Agc::process(IPAContext &context, const ipu3_uapi_stats_3a *stats)
 			break;
 	}
 
-	computeExposure(context, yGain, iqMeanGain);
+	computeExposure(context, frameContext, yGain, iqMeanGain);
 	frameCount_++;
+
+	utils::Duration exposureTime = context.configuration.sensor.lineDuration
+				     * frameContext.sensor.exposure;
+	metadata.set(controls::AnalogueGain, frameContext.sensor.gain);
+	metadata.set(controls::ExposureTime, exposureTime.get<std::micro>());
+
+	/* \todo Use VBlank value calculated from each frame exposure. */
+	uint32_t vTotal = context.configuration.sensor.size.height
+			+ context.configuration.sensor.defVBlank;
+	utils::Duration frameDuration = context.configuration.sensor.lineDuration
+				      * vTotal;
+	metadata.set(controls::FrameDuration, frameDuration.get<std::micro>());
+
 }
+
+REGISTER_IPA_ALGORITHM(Agc, "Agc")
 
 } /* namespace ipa::ipu3::algorithms */
 

@@ -46,8 +46,16 @@ public:
 			ControlInfoMap::Map *ctrls);
 	void bufferReady(FrameBuffer *buffer);
 
+	const std::string &id() const { return id_; }
+
 	std::unique_ptr<V4L2VideoDevice> video_;
 	Stream stream_;
+	std::map<PixelFormat, std::vector<SizeRange>> formats_;
+
+private:
+	bool generateId();
+
+	std::string id_;
 };
 
 class UVCCameraConfiguration : public CameraConfiguration
@@ -66,7 +74,7 @@ class PipelineHandlerUVC : public PipelineHandler
 public:
 	PipelineHandlerUVC(CameraManager *manager);
 
-	CameraConfiguration *generateConfiguration(Camera *camera,
+	std::unique_ptr<CameraConfiguration> generateConfiguration(Camera *camera,
 		const StreamRoles &roles) override;
 	int configure(Camera *camera, CameraConfiguration *config) override;
 
@@ -81,8 +89,6 @@ public:
 	bool match(DeviceEnumerator *enumerator) override;
 
 private:
-	std::string generateId(const UVCCameraData *data);
-
 	int processControl(ControlList *controls, unsigned int id,
 			   const ControlValue &value);
 	int processControls(UVCCameraData *data, Request *request);
@@ -149,7 +155,7 @@ CameraConfiguration::Status UVCCameraConfiguration::validate()
 	cfg.bufferCount = 4;
 
 	V4L2DeviceFormat format;
-	format.fourcc = V4L2PixelFormat::fromPixelFormat(cfg.pixelFormat);
+	format.fourcc = data_->video_->toV4L2PixelFormat(cfg.pixelFormat);
 	format.size = cfg.size;
 
 	int ret = data_->video_->tryFormat(&format);
@@ -159,6 +165,11 @@ CameraConfiguration::Status UVCCameraConfiguration::validate()
 	cfg.stride = format.planes[0].bpl;
 	cfg.frameSize = format.planes[0].size;
 
+	if (cfg.colorSpace != format.colorSpace) {
+		cfg.colorSpace = format.colorSpace;
+		status = Adjusted;
+	}
+
 	return status;
 }
 
@@ -167,24 +178,18 @@ PipelineHandlerUVC::PipelineHandlerUVC(CameraManager *manager)
 {
 }
 
-CameraConfiguration *PipelineHandlerUVC::generateConfiguration(Camera *camera,
+std::unique_ptr<CameraConfiguration>
+PipelineHandlerUVC::generateConfiguration(Camera *camera,
 	const StreamRoles &roles)
 {
 	UVCCameraData *data = cameraData(camera);
-	CameraConfiguration *config = new UVCCameraConfiguration(data);
+	std::unique_ptr<CameraConfiguration> config =
+		std::make_unique<UVCCameraConfiguration>(data);
 
 	if (roles.empty())
 		return config;
 
-	V4L2VideoDevice::Formats v4l2Formats = data->video_->formats();
-	std::map<PixelFormat, std::vector<SizeRange>> deviceFormats;
-	for (const auto &format : v4l2Formats) {
-		PixelFormat pixelFormat = format.first.toPixelFormat();
-		if (pixelFormat.isValid())
-			deviceFormats[pixelFormat] = format.second;
-	}
-
-	StreamFormats formats(deviceFormats);
+	StreamFormats formats(data->formats_);
 	StreamConfiguration cfg(formats);
 
 	cfg.pixelFormat = formats.pixelformats().front();
@@ -205,7 +210,7 @@ int PipelineHandlerUVC::configure(Camera *camera, CameraConfiguration *config)
 	int ret;
 
 	V4L2DeviceFormat format;
-	format.fourcc = V4L2PixelFormat::fromPixelFormat(cfg.pixelFormat);
+	format.fourcc = data->video_->toV4L2PixelFormat(cfg.pixelFormat);
 	format.size = cfg.size;
 
 	ret = data->video_->setFormat(&format);
@@ -213,7 +218,7 @@ int PipelineHandlerUVC::configure(Camera *camera, CameraConfiguration *config)
 		return ret;
 
 	if (format.size != cfg.size ||
-	    format.fourcc != V4L2PixelFormat::fromPixelFormat(cfg.pixelFormat))
+	    format.fourcc != data->video_->toV4L2PixelFormat(cfg.pixelFormat))
 		return -EINVAL;
 
 	cfg.setStream(&data->stream_);
@@ -340,12 +345,8 @@ int PipelineHandlerUVC::processControls(UVCCameraData *data, Request *request)
 {
 	ControlList controls(data->video_->controls());
 
-	for (auto it : request->controls()) {
-		unsigned int id = it.first;
-		ControlValue &value = it.second;
-
+	for (const auto &[id, value] : request->controls())
 		processControl(&controls, id, value);
-	}
 
 	for (const auto &ctrl : controls)
 		LOG(UVC, Debug)
@@ -383,9 +384,140 @@ int PipelineHandlerUVC::queueRequestDevice(Camera *camera, Request *request)
 	return 0;
 }
 
-std::string PipelineHandlerUVC::generateId(const UVCCameraData *data)
+bool PipelineHandlerUVC::match(DeviceEnumerator *enumerator)
 {
-	const std::string path = data->video_->devicePath();
+	MediaDevice *media;
+	DeviceMatch dm("uvcvideo");
+
+	media = acquireMediaDevice(enumerator, dm);
+	if (!media)
+		return false;
+
+	std::unique_ptr<UVCCameraData> data = std::make_unique<UVCCameraData>(this);
+
+	if (data->init(media))
+		return false;
+
+	/* Create and register the camera. */
+	std::string id = data->id();
+	std::set<Stream *> streams{ &data->stream_ };
+	std::shared_ptr<Camera> camera =
+		Camera::create(std::move(data), id, streams);
+	registerCamera(std::move(camera));
+
+	/* Enable hot-unplug notifications. */
+	hotplugMediaDevice(media);
+
+	return true;
+}
+
+int UVCCameraData::init(MediaDevice *media)
+{
+	int ret;
+
+	/* Locate and initialise the camera data with the default video node. */
+	const std::vector<MediaEntity *> &entities = media->entities();
+	auto entity = std::find_if(entities.begin(), entities.end(),
+				   [](MediaEntity *e) {
+					   return e->flags() & MEDIA_ENT_FL_DEFAULT;
+				   });
+	if (entity == entities.end()) {
+		LOG(UVC, Error) << "Could not find a default video device";
+		return -ENODEV;
+	}
+
+	/* Create and open the video device. */
+	video_ = std::make_unique<V4L2VideoDevice>(*entity);
+	ret = video_->open();
+	if (ret)
+		return ret;
+
+	video_->bufferReady.connect(this, &UVCCameraData::bufferReady);
+
+	/* Generate the camera ID. */
+	if (!generateId()) {
+		LOG(UVC, Error) << "Failed to generate camera ID";
+		return -EINVAL;
+	}
+
+	/*
+	 * Populate the map of supported formats, and infer the camera sensor
+	 * resolution from the largest size it advertises.
+	 */
+	Size resolution;
+	for (const auto &format : video_->formats()) {
+		PixelFormat pixelFormat = format.first.toPixelFormat();
+		if (!pixelFormat.isValid())
+			continue;
+
+		formats_[pixelFormat] = format.second;
+
+		const std::vector<SizeRange> &sizeRanges = format.second;
+		for (const SizeRange &sizeRange : sizeRanges) {
+			if (sizeRange.max > resolution)
+				resolution = sizeRange.max;
+		}
+	}
+
+	if (formats_.empty()) {
+		LOG(UVC, Error)
+			<< "Camera " << id_ << " (" << media->model()
+			<< ") doesn't expose any supported format";
+		return -EINVAL;
+	}
+
+	/* Populate the camera properties. */
+	properties_.set(properties::Model, utils::toAscii(media->model()));
+
+	/*
+	 * Derive the location from the device removable attribute in sysfs.
+	 * Non-removable devices are assumed to be front as we lack detailed
+	 * location information, and removable device are considered external.
+	 *
+	 * The sysfs removable attribute is derived from the ACPI _UPC attribute
+	 * if available, or from the USB hub descriptors otherwise. ACPI data
+	 * may not be very reliable, and the USB hub descriptors may not be
+	 * accurate on DT-based platforms. A heuristic may need to be
+	 * implemented later if too many devices end up being miscategorized.
+	 *
+	 * \todo Find a way to tell front and back devices apart. This could
+	 * come from the ACPI _PLD, but that may be even more unreliable than
+	 * the _UPC.
+	 */
+	properties::LocationEnum location = properties::CameraLocationExternal;
+	std::ifstream file(video_->devicePath() + "/../removable");
+	if (file.is_open()) {
+		std::string value;
+		std::getline(file, value);
+		file.close();
+
+		if (value == "fixed")
+			location = properties::CameraLocationFront;
+	}
+
+	properties_.set(properties::Location, location);
+
+	properties_.set(properties::PixelArraySize, resolution);
+	properties_.set(properties::PixelArrayActiveAreas, { Rectangle(resolution) });
+
+	/* Initialise the supported controls. */
+	ControlInfoMap::Map ctrls;
+
+	for (const auto &ctrl : video_->controls()) {
+		uint32_t cid = ctrl.first->id();
+		const ControlInfo &info = ctrl.second;
+
+		addControl(cid, info, &ctrls);
+	}
+
+	controlInfo_ = ControlInfoMap(std::move(ctrls), controls::controls);
+
+	return 0;
+}
+
+bool UVCCameraData::generateId()
+{
+	const std::string path = video_->devicePath();
 
 	/* Create a controller ID from first device described in firmware. */
 	std::string controllerId;
@@ -394,7 +526,7 @@ std::string PipelineHandlerUVC::generateId(const UVCCameraData *data)
 		std::string::size_type pos = searchPath.rfind('/');
 		if (pos <= 1) {
 			LOG(UVC, Error) << "Can not find controller ID";
-			return {};
+			return false;
 		}
 
 		searchPath = searchPath.substr(0, pos);
@@ -431,7 +563,7 @@ std::string PipelineHandlerUVC::generateId(const UVCCameraData *data)
 		std::ifstream file(path + "/../" + name);
 
 		if (!file.is_open())
-			return {};
+			return false;
 
 		std::string value;
 		std::getline(file, value);
@@ -443,100 +575,8 @@ std::string PipelineHandlerUVC::generateId(const UVCCameraData *data)
 		deviceId += value;
 	}
 
-	return controllerId + "-" + usbId + "-" + deviceId;
-}
-
-bool PipelineHandlerUVC::match(DeviceEnumerator *enumerator)
-{
-	MediaDevice *media;
-	DeviceMatch dm("uvcvideo");
-
-	media = acquireMediaDevice(enumerator, dm);
-	if (!media)
-		return false;
-
-	std::unique_ptr<UVCCameraData> data = std::make_unique<UVCCameraData>(this);
-
-	if (data->init(media))
-		return false;
-
-	/* Create and register the camera. */
-	std::string id = generateId(data.get());
-	if (id.empty()) {
-		LOG(UVC, Error) << "Failed to generate camera ID";
-		return false;
-	}
-
-	std::set<Stream *> streams{ &data->stream_ };
-	std::shared_ptr<Camera> camera =
-		Camera::create(std::move(data), id, streams);
-	registerCamera(std::move(camera));
-
-	/* Enable hot-unplug notifications. */
-	hotplugMediaDevice(media);
-
+	id_ = controllerId + "-" + usbId + "-" + deviceId;
 	return true;
-}
-
-int UVCCameraData::init(MediaDevice *media)
-{
-	int ret;
-
-	/* Locate and initialise the camera data with the default video node. */
-	const std::vector<MediaEntity *> &entities = media->entities();
-	auto entity = std::find_if(entities.begin(), entities.end(),
-				   [](MediaEntity *e) {
-					   return e->flags() & MEDIA_ENT_FL_DEFAULT;
-				   });
-	if (entity == entities.end()) {
-		LOG(UVC, Error) << "Could not find a default video device";
-		return -ENODEV;
-	}
-
-	/* Create and open the video device. */
-	video_ = std::make_unique<V4L2VideoDevice>(*entity);
-	ret = video_->open();
-	if (ret)
-		return ret;
-
-	video_->bufferReady.connect(this, &UVCCameraData::bufferReady);
-
-	/*
-	 * \todo Find a way to tell internal and external UVC cameras apart.
-	 * Until then, treat all UVC cameras as external.
-	 */
-	properties_.set(properties::Location, properties::CameraLocationExternal);
-	properties_.set(properties::Model, utils::toAscii(media->model()));
-
-	/*
-	 * Get the current format in order to initialize the sensor array
-	 * properties.
-	 */
-	Size resolution;
-	for (const auto &it : video_->formats()) {
-		const std::vector<SizeRange> &sizeRanges = it.second;
-		for (const SizeRange &sizeRange : sizeRanges) {
-			if (sizeRange.max > resolution)
-				resolution = sizeRange.max;
-		}
-	}
-
-	properties_.set(properties::PixelArraySize, resolution);
-	properties_.set(properties::PixelArrayActiveAreas, { Rectangle(resolution) });
-
-	/* Initialise the supported controls. */
-	ControlInfoMap::Map ctrls;
-
-	for (const auto &ctrl : video_->controls()) {
-		uint32_t cid = ctrl.first->id();
-		const ControlInfo &info = ctrl.second;
-
-		addControl(cid, info, &ctrls);
-	}
-
-	controlInfo_ = ControlInfoMap(std::move(ctrls), controls::controls);
-
-	return 0;
 }
 
 void UVCCameraData::addControl(uint32_t cid, const ControlInfo &v4l2Info,

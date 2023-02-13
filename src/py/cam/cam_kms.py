@@ -5,20 +5,13 @@ import pykms
 import selectors
 import sys
 
-FMT_MAP = {
-    'RGB888': pykms.PixelFormat.RGB888,
-    'YUYV': pykms.PixelFormat.YUYV,
-    'ARGB8888': pykms.PixelFormat.ARGB8888,
-    'XRGB8888': pykms.PixelFormat.XRGB8888,
-}
-
 
 class KMSRenderer:
     def __init__(self, state):
         self.state = state
 
-        self.cm = state['cm']
-        self.contexts = state['contexts']
+        self.cm = state.cm
+        self.contexts = state.contexts
         self.running = False
 
         card = pykms.Card()
@@ -74,12 +67,13 @@ class KMSRenderer:
 
         buffers = drmreq['camreq'].buffers
 
+        req = pykms.AtomicReq(self.card)
+
         for stream, fb in buffers.items():
             drmfb = self.cam_2_drm.get(fb, None)
-
-            req = pykms.AtomicReq(self.card)
             self.add_plane(req, stream, drmfb)
-            req.commit()
+
+        req.commit()
 
     def handle_page_flip(self, frame, time):
         old = self.current
@@ -98,7 +92,7 @@ class KMSRenderer:
         if old:
             req = old['camreq']
             ctx = old['camctx']
-            self.state['request_prcessed'](ctx, req)
+            self.state.request_processed(ctx, req)
 
     def queue(self, drmreq):
         if not self.next:
@@ -114,11 +108,11 @@ class KMSRenderer:
 
         idx = 0
         for ctx in self.contexts:
-            for stream in ctx['streams']:
+            for stream in ctx.streams:
 
                 cfg = stream.configuration
                 fmt = cfg.pixel_format
-                fmt = FMT_MAP[fmt]
+                fmt = pykms.PixelFormat(fmt.fourcc)
 
                 plane = self.resman.reserve_generic_plane(self.crtc, fmt)
                 assert(plane is not None)
@@ -131,12 +125,19 @@ class KMSRenderer:
                     'size': cfg.size,
                 })
 
-                for fb in ctx['allocator'].buffers(stream):
-                    w, h = cfg.size
-                    stride = cfg.stride
-                    fd = fb.fd(0)
+                for fb in ctx.allocator.buffers(stream):
+                    w = cfg.size.width
+                    h = cfg.size.height
+                    fds = []
+                    strides = []
+                    offsets = []
+                    for plane in fb.planes:
+                        fds.append(plane.fd)
+                        strides.append(cfg.stride)
+                        offsets.append(plane.offset)
+
                     drmfb = pykms.DmabufFramebuffer(self.card, w, h, fmt,
-                                                    [fd], [stride], [0])
+                                                    fds, strides, offsets)
                     self.cam_2_drm[fb] = drmfb
 
                 idx += 1
@@ -147,7 +148,7 @@ class KMSRenderer:
                 self.handle_page_flip(ev.seq, ev.time)
 
     def readcam(self, fd):
-        self.running = self.state['event_handler'](self.state)
+        self.running = self.state.event_handler()
 
     def readkey(self, fileobj):
         sys.stdin.readline()
@@ -160,7 +161,7 @@ class KMSRenderer:
 
         sel = selectors.DefaultSelector()
         sel.register(self.card.fd, selectors.EVENT_READ, self.readdrm)
-        sel.register(self.cm.efd, selectors.EVENT_READ, self.readcam)
+        sel.register(self.cm.event_fd, selectors.EVENT_READ, self.readcam)
         sel.register(sys.stdin, selectors.EVENT_READ, self.readkey)
 
         print('Press enter to exit')

@@ -45,10 +45,10 @@ public:
 	MediaDevice *acquireMediaDevice(DeviceEnumerator *enumerator,
 					const DeviceMatch &dm);
 
-	bool lock();
-	void unlock();
+	bool acquire();
+	void release(Camera *camera);
 
-	virtual CameraConfiguration *generateConfiguration(Camera *camera,
+	virtual std::unique_ptr<CameraConfiguration> generateConfiguration(Camera *camera,
 		const StreamRoles &roles) = 0;
 	virtual int configure(Camera *camera, CameraConfiguration *config) = 0;
 
@@ -65,6 +65,9 @@ public:
 	bool completeBuffer(Request *request, FrameBuffer *buffer);
 	void completeRequest(Request *request);
 
+	std::string configurationFile(const std::string &subdir,
+				      const std::string &name) const;
+
 	const char *name() const { return name_; }
 
 protected:
@@ -74,9 +77,13 @@ protected:
 	virtual int queueRequestDevice(Camera *camera, Request *request) = 0;
 	virtual void stopDevice(Camera *camera) = 0;
 
+	virtual void releaseDevice(Camera *camera);
+
 	CameraManager *manager_;
 
 private:
+	void unlockMediaDevices();
+
 	void mediaDeviceDisconnected(MediaDevice *media);
 	virtual void disconnect();
 
@@ -91,42 +98,49 @@ private:
 	const char *name_;
 
 	Mutex lock_;
-	bool lockOwner_ LIBCAMERA_TSA_GUARDED_BY(lock_); /* *Not* ownership of lock_ */
+	unsigned int useCount_ LIBCAMERA_TSA_GUARDED_BY(lock_);
 
-	friend class PipelineHandlerFactory;
+	friend class PipelineHandlerFactoryBase;
 };
 
-class PipelineHandlerFactory
+class PipelineHandlerFactoryBase
 {
 public:
-	PipelineHandlerFactory(const char *name);
-	virtual ~PipelineHandlerFactory() = default;
+	PipelineHandlerFactoryBase(const char *name);
+	virtual ~PipelineHandlerFactoryBase() = default;
 
-	std::shared_ptr<PipelineHandler> create(CameraManager *manager);
+	std::shared_ptr<PipelineHandler> create(CameraManager *manager) const;
 
 	const std::string &name() const { return name_; }
 
-	static void registerType(PipelineHandlerFactory *factory);
-	static std::vector<PipelineHandlerFactory *> &factories();
+	static std::vector<PipelineHandlerFactoryBase *> &factories();
 
 private:
-	virtual PipelineHandler *createInstance(CameraManager *manager) = 0;
+	static void registerType(PipelineHandlerFactoryBase *factory);
+
+	virtual std::unique_ptr<PipelineHandler>
+	createInstance(CameraManager *manager) const = 0;
 
 	std::string name_;
 };
 
-#define REGISTER_PIPELINE_HANDLER(handler)				\
-class handler##Factory final : public PipelineHandlerFactory		\
-{									\
-public:									\
-	handler##Factory() : PipelineHandlerFactory(#handler) {}	\
-									\
-private:								\
-	PipelineHandler *createInstance(CameraManager *manager)		\
-	{								\
-		return new handler(manager);				\
-	}								\
-};									\
-static handler##Factory global_##handler##Factory;
+template<typename _PipelineHandler>
+class PipelineHandlerFactory final : public PipelineHandlerFactoryBase
+{
+public:
+	PipelineHandlerFactory(const char *name)
+		: PipelineHandlerFactoryBase(name)
+	{
+	}
+
+	std::unique_ptr<PipelineHandler>
+	createInstance(CameraManager *manager) const override
+	{
+		return std::make_unique<_PipelineHandler>(manager);
+	}
+};
+
+#define REGISTER_PIPELINE_HANDLER(handler) \
+static PipelineHandlerFactory<handler> global_##handler##Factory(#handler);
 
 } /* namespace libcamera */

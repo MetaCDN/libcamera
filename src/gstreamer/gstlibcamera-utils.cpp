@@ -8,6 +8,7 @@
 
 #include "gstlibcamera-utils.h"
 
+#include <libcamera/control_ids.h>
 #include <libcamera/formats.h>
 
 using namespace libcamera;
@@ -19,9 +20,27 @@ static struct {
 	/* Compressed */
 	{ GST_VIDEO_FORMAT_ENCODED, formats::MJPEG },
 
-	/* RGB */
+	/* Bayer formats, gstreamer only supports 8-bit */
+	{ GST_VIDEO_FORMAT_ENCODED, formats::SBGGR8 },
+	{ GST_VIDEO_FORMAT_ENCODED, formats::SGBRG8 },
+	{ GST_VIDEO_FORMAT_ENCODED, formats::SGRBG8 },
+	{ GST_VIDEO_FORMAT_ENCODED, formats::SRGGB8 },
+
+	/* RGB16 */
+	{ GST_VIDEO_FORMAT_RGB16, formats::RGB565 },
+
+	/* RGB24 */
 	{ GST_VIDEO_FORMAT_RGB, formats::BGR888 },
 	{ GST_VIDEO_FORMAT_BGR, formats::RGB888 },
+
+	/* RGB32 */
+	{ GST_VIDEO_FORMAT_BGRx, formats::XRGB8888 },
+	{ GST_VIDEO_FORMAT_RGBx, formats::XBGR8888 },
+	{ GST_VIDEO_FORMAT_xBGR, formats::RGBX8888 },
+	{ GST_VIDEO_FORMAT_xRGB, formats::BGRX8888 },
+	{ GST_VIDEO_FORMAT_BGRA, formats::ARGB8888 },
+	{ GST_VIDEO_FORMAT_RGBA, formats::ABGR8888 },
+	{ GST_VIDEO_FORMAT_ABGR, formats::RGBA8888 },
 	{ GST_VIDEO_FORMAT_ARGB, formats::BGRA8888 },
 
 	/* YUV Semiplanar */
@@ -45,6 +64,154 @@ static struct {
 	/* \todo NV42 is used in libcamera but is not mapped in GStreamer yet. */
 };
 
+static GstVideoColorimetry
+colorimetry_from_colorspace(const ColorSpace &colorSpace)
+{
+	GstVideoColorimetry colorimetry;
+
+	switch (colorSpace.primaries) {
+	case ColorSpace::Primaries::Raw:
+		colorimetry.primaries = GST_VIDEO_COLOR_PRIMARIES_UNKNOWN;
+		break;
+	case ColorSpace::Primaries::Smpte170m:
+		colorimetry.primaries = GST_VIDEO_COLOR_PRIMARIES_SMPTE170M;
+		break;
+	case ColorSpace::Primaries::Rec709:
+		colorimetry.primaries = GST_VIDEO_COLOR_PRIMARIES_BT709;
+		break;
+	case ColorSpace::Primaries::Rec2020:
+		colorimetry.primaries = GST_VIDEO_COLOR_PRIMARIES_BT2020;
+		break;
+	}
+
+	switch (colorSpace.transferFunction) {
+	case ColorSpace::TransferFunction::Linear:
+		colorimetry.transfer = GST_VIDEO_TRANSFER_GAMMA10;
+		break;
+	case ColorSpace::TransferFunction::Srgb:
+		colorimetry.transfer = GST_VIDEO_TRANSFER_SRGB;
+		break;
+	case ColorSpace::TransferFunction::Rec709:
+		colorimetry.transfer = GST_VIDEO_TRANSFER_BT709;
+		break;
+	}
+
+	switch (colorSpace.ycbcrEncoding) {
+	case ColorSpace::YcbcrEncoding::None:
+		colorimetry.matrix = GST_VIDEO_COLOR_MATRIX_RGB;
+		break;
+	case ColorSpace::YcbcrEncoding::Rec601:
+		colorimetry.matrix = GST_VIDEO_COLOR_MATRIX_BT601;
+		break;
+	case ColorSpace::YcbcrEncoding::Rec709:
+		colorimetry.matrix = GST_VIDEO_COLOR_MATRIX_BT709;
+		break;
+	case ColorSpace::YcbcrEncoding::Rec2020:
+		colorimetry.matrix = GST_VIDEO_COLOR_MATRIX_BT2020;
+		break;
+	}
+
+	switch (colorSpace.range) {
+	case ColorSpace::Range::Full:
+		colorimetry.range = GST_VIDEO_COLOR_RANGE_0_255;
+		break;
+	case ColorSpace::Range::Limited:
+		colorimetry.range = GST_VIDEO_COLOR_RANGE_16_235;
+		break;
+	}
+
+	return colorimetry;
+}
+
+static std::optional<ColorSpace>
+colorspace_from_colorimetry(const GstVideoColorimetry &colorimetry)
+{
+	std::optional<ColorSpace> colorspace = ColorSpace::Raw;
+
+	switch (colorimetry.primaries) {
+	case GST_VIDEO_COLOR_PRIMARIES_UNKNOWN:
+		/* Unknown primaries map to raw colorspace in gstreamer */
+		return ColorSpace::Raw;
+	case GST_VIDEO_COLOR_PRIMARIES_SMPTE170M:
+		colorspace->primaries = ColorSpace::Primaries::Smpte170m;
+		break;
+	case GST_VIDEO_COLOR_PRIMARIES_BT709:
+		colorspace->primaries = ColorSpace::Primaries::Rec709;
+		break;
+	case GST_VIDEO_COLOR_PRIMARIES_BT2020:
+		colorspace->primaries = ColorSpace::Primaries::Rec2020;
+		break;
+	default:
+		GST_WARNING("Colorimetry primaries %d not mapped in gstlibcamera",
+			    colorimetry.primaries);
+		return std::nullopt;
+	}
+
+	switch (colorimetry.transfer) {
+	/* Transfer function mappings inspired from v4l2src plugin */
+	case GST_VIDEO_TRANSFER_GAMMA18:
+	case GST_VIDEO_TRANSFER_GAMMA20:
+	case GST_VIDEO_TRANSFER_GAMMA22:
+	case GST_VIDEO_TRANSFER_GAMMA28:
+		GST_WARNING("GAMMA 18, 20, 22, 28 transfer functions not supported");
+		[[fallthrough]];
+	case GST_VIDEO_TRANSFER_GAMMA10:
+		colorspace->transferFunction = ColorSpace::TransferFunction::Linear;
+		break;
+	case GST_VIDEO_TRANSFER_SRGB:
+		colorspace->transferFunction = ColorSpace::TransferFunction::Srgb;
+		break;
+#if GST_CHECK_VERSION(1, 18, 0)
+	case GST_VIDEO_TRANSFER_BT601:
+	case GST_VIDEO_TRANSFER_BT2020_10:
+#endif
+	case GST_VIDEO_TRANSFER_BT2020_12:
+	case GST_VIDEO_TRANSFER_BT709:
+		colorspace->transferFunction = ColorSpace::TransferFunction::Rec709;
+		break;
+	default:
+		GST_WARNING("Colorimetry transfer function %d not mapped in gstlibcamera",
+			    colorimetry.transfer);
+		return std::nullopt;
+	}
+
+	switch (colorimetry.matrix) {
+	case GST_VIDEO_COLOR_MATRIX_RGB:
+		colorspace->ycbcrEncoding = ColorSpace::YcbcrEncoding::None;
+		break;
+	/* FCC is about the same as BT601 with less digit */
+	case GST_VIDEO_COLOR_MATRIX_FCC:
+	case GST_VIDEO_COLOR_MATRIX_BT601:
+		colorspace->ycbcrEncoding = ColorSpace::YcbcrEncoding::Rec601;
+		break;
+	case GST_VIDEO_COLOR_MATRIX_BT709:
+		colorspace->ycbcrEncoding = ColorSpace::YcbcrEncoding::Rec709;
+		break;
+	case GST_VIDEO_COLOR_MATRIX_BT2020:
+		colorspace->ycbcrEncoding = ColorSpace::YcbcrEncoding::Rec2020;
+		break;
+	default:
+		GST_WARNING("Colorimetry matrix %d not mapped in gstlibcamera",
+			    colorimetry.matrix);
+		return std::nullopt;
+	}
+
+	switch (colorimetry.range) {
+	case GST_VIDEO_COLOR_RANGE_0_255:
+		colorspace->range = ColorSpace::Range::Full;
+		break;
+	case GST_VIDEO_COLOR_RANGE_16_235:
+		colorspace->range = ColorSpace::Range::Limited;
+		break;
+	default:
+		GST_WARNING("Colorimetry range %d not mapped in gstlibcamera",
+			    colorimetry.range);
+		return std::nullopt;
+	}
+
+	return colorspace;
+}
+
 static GstVideoFormat
 pixel_format_to_gst_format(const PixelFormat &format)
 {
@@ -67,6 +234,22 @@ gst_format_to_pixel_format(GstVideoFormat gst_format)
 	return PixelFormat{};
 }
 
+static const gchar *
+bayer_format_to_string(int format)
+{
+	switch (format) {
+	case formats::SBGGR8:
+		return "bggr";
+	case formats::SGBRG8:
+		return "gbrg";
+	case formats::SGRBG8:
+		return "grbg";
+	case formats::SRGGB8:
+		return "rggb";
+	}
+	return NULL;
+}
+
 static GstStructure *
 bare_structure_from_format(const PixelFormat &format)
 {
@@ -82,6 +265,14 @@ bare_structure_from_format(const PixelFormat &format)
 	switch (format) {
 	case formats::MJPEG:
 		return gst_structure_new_empty("image/jpeg");
+
+	case formats::SBGGR8:
+	case formats::SGBRG8:
+	case formats::SGRBG8:
+	case formats::SRGGB8:
+		return gst_structure_new("video/x-bayer", "format", G_TYPE_STRING,
+					 bayer_format_to_string(format), nullptr);
+
 	default:
 		return nullptr;
 	}
@@ -139,6 +330,18 @@ gst_libcamera_stream_configuration_to_caps(const StreamConfiguration &stream_cfg
 			  "width", G_TYPE_INT, stream_cfg.size.width,
 			  "height", G_TYPE_INT, stream_cfg.size.height,
 			  nullptr);
+
+	if (stream_cfg.colorSpace) {
+		GstVideoColorimetry colorimetry = colorimetry_from_colorspace(stream_cfg.colorSpace.value());
+		gchar *colorimetry_str = gst_video_colorimetry_to_string(&colorimetry);
+
+		if (colorimetry_str)
+			gst_structure_set(s, "colorimetry", G_TYPE_STRING, colorimetry_str, nullptr);
+		else
+			g_error("Got invalid colorimetry from ColorSpace: %s",
+				ColorSpace::toString(stream_cfg.colorSpace).c_str());
+	}
+
 	gst_caps_append_structure(caps, s);
 
 	return caps;
@@ -222,18 +425,110 @@ gst_libcamera_configure_stream_from_caps(StreamConfiguration &stream_cfg,
 	gst_structure_get_int(s, "height", &height);
 	stream_cfg.size.width = width;
 	stream_cfg.size.height = height;
+
+	/* Configure colorimetry */
+	if (gst_structure_has_field(s, "colorimetry")) {
+		const gchar *colorimetry_str = gst_structure_get_string(s, "colorimetry");
+		GstVideoColorimetry colorimetry;
+
+		if (!gst_video_colorimetry_from_string(&colorimetry, colorimetry_str))
+			g_critical("Invalid colorimetry %s", colorimetry_str);
+
+		stream_cfg.colorSpace = colorspace_from_colorimetry(colorimetry);
+	}
 }
 
-void
-gst_libcamera_resume_task(GstTask *task)
+void gst_libcamera_get_framerate_from_caps(GstCaps *caps,
+					   GstStructure *element_caps)
+{
+	GstStructure *s = gst_caps_get_structure(caps, 0);
+	/*
+	 * Default to 30 fps. If the "framerate" fraction is invalid below,
+	 * libcamerasrc will set 30fps as the framerate.
+	 */
+	gint fps_n = 30, fps_d = 1;
+
+	if (gst_structure_has_field_typed(s, "framerate", GST_TYPE_FRACTION)) {
+		if (!gst_structure_get_fraction(s, "framerate", &fps_n, &fps_d))
+			GST_WARNING("Invalid framerate in the caps");
+	}
+
+	gst_structure_set(element_caps, "framerate", GST_TYPE_FRACTION,
+			  fps_n, fps_d, nullptr);
+}
+
+void gst_libcamera_clamp_and_set_frameduration(ControlList &initCtrls,
+					       const ControlInfoMap &cam_ctrls,
+					       GstStructure *element_caps)
+{
+	gint fps_caps_n, fps_caps_d;
+
+	if (!gst_structure_has_field_typed(element_caps, "framerate", GST_TYPE_FRACTION))
+		return;
+
+	auto iterFrameDuration = cam_ctrls.find(&controls::FrameDurationLimits);
+	if (iterFrameDuration == cam_ctrls.end()) {
+		GST_WARNING("FrameDurationLimits not found in camera controls.");
+		return;
+	}
+
+	const GValue *framerate = gst_structure_get_value(element_caps, "framerate");
+
+	fps_caps_n = gst_value_get_fraction_numerator(framerate);
+	fps_caps_d = gst_value_get_fraction_denominator(framerate);
+
+	int64_t target_duration = (fps_caps_d * 1000000.0) / fps_caps_n;
+	int64_t min_frame_duration = iterFrameDuration->second.min().get<int64_t>();
+	int64_t max_frame_duration = iterFrameDuration->second.max().get<int64_t>();
+
+	int64_t frame_duration = std::clamp(target_duration,
+					    min_frame_duration,
+					    max_frame_duration);
+
+	if (frame_duration != target_duration) {
+		gint framerate_clamped = 1000000 / frame_duration;
+
+		/*
+		 * Update the clamped framerate which then will be exposed in
+		 * downstream caps.
+		 */
+		gst_structure_set(element_caps, "framerate", GST_TYPE_FRACTION,
+				  framerate_clamped, 1, nullptr);
+	}
+
+	initCtrls.set(controls::FrameDurationLimits,
+		      { frame_duration, frame_duration });
+}
+
+void gst_libcamera_framerate_to_caps(GstCaps *caps, const GstStructure *element_caps)
+{
+	const GValue *framerate = gst_structure_get_value(element_caps, "framerate");
+	if (!GST_VALUE_HOLDS_FRACTION(framerate))
+		return;
+
+	GstStructure *s = gst_caps_get_structure(caps, 0);
+	gint fps_caps_n, fps_caps_d;
+
+	fps_caps_n = gst_value_get_fraction_numerator(framerate);
+	fps_caps_d = gst_value_get_fraction_denominator(framerate);
+
+	gst_structure_set(s, "framerate", GST_TYPE_FRACTION, fps_caps_n, fps_caps_d, nullptr);
+}
+
+#if !GST_CHECK_VERSION(1, 17, 1)
+gboolean
+gst_task_resume(GstTask *task)
 {
 	/* We only want to resume the task if it's paused. */
 	GLibLocker lock(GST_OBJECT(task));
-	if (GST_TASK_STATE(task) == GST_TASK_PAUSED) {
-		GST_TASK_STATE(task) = GST_TASK_STARTED;
-		GST_TASK_SIGNAL(task);
-	}
+	if (GST_TASK_STATE(task) != GST_TASK_PAUSED)
+		return FALSE;
+
+	GST_TASK_STATE(task) = GST_TASK_STARTED;
+	GST_TASK_SIGNAL(task);
+	return TRUE;
 }
+#endif
 
 G_LOCK_DEFINE_STATIC(cm_singleton_lock);
 static std::weak_ptr<CameraManager> cm_singleton_ptr;

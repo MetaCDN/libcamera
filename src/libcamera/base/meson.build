@@ -22,8 +22,8 @@ libcamera_base_sources = files([
     'utils.cpp',
 ])
 
-libdw = cc.find_library('libdw', required : false)
-libunwind = cc.find_library('libunwind', required : false)
+libdw = dependency('libdw', required : false)
+libunwind = dependency('libunwind', required : false)
 
 if cc.has_header_symbol('execinfo.h', 'backtrace')
     config_h.set('HAVE_BACKTRACE', 1)
@@ -38,9 +38,9 @@ if libunwind.found()
 endif
 
 libcamera_base_deps = [
-    dependency('threads'),
     libatomic,
     libdw,
+    libthreads,
     libunwind,
 ]
 
@@ -51,6 +51,7 @@ libcamera_base_args = [ '-DLIBCAMERA_BASE_PRIVATE' ]
 libcamera_base_lib = shared_library('libcamera-base',
                                     [libcamera_base_sources, libcamera_base_headers],
                                     version : libcamera_version,
+                                    soversion : libcamera_soversion,
                                     name_prefix : '',
                                     install : true,
                                     cpp_args : libcamera_base_args,

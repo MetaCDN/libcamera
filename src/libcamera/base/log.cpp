@@ -46,11 +46,11 @@
  * their category are output to the log, while other messages are silently
  * discarded.
  *
- * By default log messages are output to stderr. They can be redirected to a log
- * file by setting the LIBCAMERA_LOG_FILE environment variable to the name of
- * the file. The file must be writable and is truncated if it exists. If any
+ * By default log messages are output to std::cerr. They can be redirected to a
+ * log file by setting the LIBCAMERA_LOG_FILE environment variable to the name
+ * of the file. The file must be writable and is truncated if it exists. If any
  * error occurs when opening the file, the file is ignored and the log is output
- * to stderr.
+ * to std::cerr.
  */
 
 /**
@@ -104,8 +104,8 @@ static const char *log_severity_name(LogSeverity severity)
 class LogOutput
 {
 public:
-	LogOutput(const char *path);
-	LogOutput(std::ostream *stream);
+	LogOutput(const char *path, bool color);
+	LogOutput(std::ostream *stream, bool color);
 	LogOutput();
 	~LogOutput();
 
@@ -119,14 +119,16 @@ private:
 
 	std::ostream *stream_;
 	LoggingTarget target_;
+	bool color_;
 };
 
 /**
  * \brief Construct a log output based on a file
  * \param[in] path Full path to log file
+ * \param[in] color True to output colored messages
  */
-LogOutput::LogOutput(const char *path)
-	: target_(LoggingTargetFile)
+LogOutput::LogOutput(const char *path, bool color)
+	: target_(LoggingTargetFile), color_(color)
 {
 	stream_ = new std::ofstream(path);
 }
@@ -134,9 +136,10 @@ LogOutput::LogOutput(const char *path)
 /**
  * \brief Construct a log output based on a stream
  * \param[in] stream Stream to send log output to
+ * \param[in] color True to output colored messages
  */
-LogOutput::LogOutput(std::ostream *stream)
-	: stream_(stream), target_(LoggingTargetStream)
+LogOutput::LogOutput(std::ostream *stream, bool color)
+	: stream_(stream), target_(LoggingTargetStream), color_(color)
 {
 }
 
@@ -144,7 +147,7 @@ LogOutput::LogOutput(std::ostream *stream)
  * \brief Construct a log output to syslog
  */
 LogOutput::LogOutput()
-	: stream_(nullptr), target_(LoggingTargetSyslog)
+	: stream_(nullptr), target_(LoggingTargetSyslog), color_(false)
 {
 	openlog("libcamera", LOG_PID, 0);
 }
@@ -179,28 +182,72 @@ bool LogOutput::isValid() const
 	}
 }
 
+namespace {
+
+/*
+ * For more information about ANSI escape codes, see
+ * https://en.wikipedia.org/wiki/ANSI_escape_code#Colors.
+ */
+constexpr const char *kColorReset = "\033[0m";
+constexpr const char *kColorGreen = "\033[0;32m";
+constexpr const char *kColorBrightRed = "\033[1;31m";
+constexpr const char *kColorBrightGreen = "\033[1;32m";
+constexpr const char *kColorBrightYellow = "\033[1;33m";
+constexpr const char *kColorBrightBlue = "\033[1;34m";
+constexpr const char *kColorBrightMagenta = "\033[1;35m";
+constexpr const char *kColorBrightCyan = "\033[1;36m";
+constexpr const char *kColorBrightWhite = "\033[1;37m";
+
+} /* namespace */
+
 /**
  * \brief Write message to log output
  * \param[in] msg Message to write
  */
 void LogOutput::write(const LogMessage &msg)
 {
+	static const char *const severityColors[] = {
+		kColorBrightCyan,
+		kColorBrightGreen,
+		kColorBrightYellow,
+		kColorBrightRed,
+		kColorBrightMagenta,
+	};
+
+	const char *categoryColor = color_ ? kColorBrightWhite : "";
+	const char *fileColor = color_ ? kColorBrightBlue : "";
+	const char *prefixColor = color_ ? kColorGreen : "";
+	const char *resetColor = color_ ? kColorReset : "";
+	const char *severityColor = "";
+	LogSeverity severity = msg.severity();
 	std::string str;
+
+	if (color_) {
+		if (static_cast<unsigned int>(severity) < std::size(severityColors))
+			severityColor = severityColors[severity];
+		else
+			severityColor = kColorBrightWhite;
+	}
 
 	switch (target_) {
 	case LoggingTargetSyslog:
-		str = std::string(log_severity_name(msg.severity())) + " "
-		    + msg.category().name() + " " + msg.fileInfo() + " "
-		    + msg.msg();
-		writeSyslog(msg.severity(), str);
+		str = std::string(log_severity_name(severity)) + " "
+		    + msg.category().name() + " " + msg.fileInfo() + " ";
+		if (!msg.prefix().empty())
+			str += msg.prefix() + ": ";
+		str += msg.msg();
+		writeSyslog(severity, str);
 		break;
 	case LoggingTargetStream:
 	case LoggingTargetFile:
 		str = "[" + utils::time_point_to_string(msg.timestamp()) + "] ["
 		    + std::to_string(Thread::currentId()) + "] "
-		    + log_severity_name(msg.severity()) + " "
-		    + msg.category().name() + " " + msg.fileInfo() + " "
-		    + msg.msg();
+		    + severityColor + log_severity_name(severity) + " "
+		    + categoryColor + msg.category().name() + " "
+		    + fileColor + msg.fileInfo() + " ";
+		if (!msg.prefix().empty())
+			str += prefixColor + msg.prefix() + ": ";
+		str += resetColor + msg.msg();
 		writeStream(str);
 		break;
 	default:
@@ -253,8 +300,8 @@ public:
 	void write(const LogMessage &msg);
 	void backtrace();
 
-	int logSetFile(const char *path);
-	int logSetStream(std::ostream *stream);
+	int logSetFile(const char *path, bool color);
+	int logSetStream(std::ostream *stream, bool color);
 	int logSetTarget(LoggingTarget target);
 	void logSetLevel(const char *category, const char *level);
 
@@ -267,10 +314,11 @@ private:
 
 	friend LogCategory;
 	void registerCategory(LogCategory *category);
+	LogCategory *findCategory(const char *name) const;
 
 	static bool destroyed_;
 
-	std::unordered_set<LogCategory *> categories_;
+	std::vector<LogCategory *> categories_;
 	std::list<std::pair<std::string, LogSeverity>> levels_;
 
 	std::shared_ptr<LogOutput> output_;
@@ -298,35 +346,47 @@ bool Logger::destroyed_ = false;
 /**
  * \brief Direct logging to a file
  * \param[in] path Full path to the log file
+ * \param[in] color True to output colored messages
  *
  * This function directs the log output to the file identified by \a path. The
  * previous log target, if any, is closed, and all new log messages will be
  * written to the new log file.
  *
+ * \a color controls whether or not the messages will be colored with standard
+ * ANSI escape codes. This is done regardless of whether \a path refers to a
+ * standard file or a TTY, the caller is responsible for disabling coloring when
+ * not suitable for the log target.
+ *
  * If the function returns an error, the log target is not changed.
  *
  * \return Zero on success, or a negative error code otherwise
  */
-int logSetFile(const char *path)
+int logSetFile(const char *path, bool color)
 {
-	return Logger::instance()->logSetFile(path);
+	return Logger::instance()->logSetFile(path, color);
 }
 
 /**
  * \brief Direct logging to a stream
  * \param[in] stream Stream to send log output to
+ * \param[in] color True to output colored messages
  *
  * This function directs the log output to \a stream. The previous log target,
  * if any, is closed, and all new log messages will be written to the new log
  * stream.
  *
+ * \a color controls whether or not the messages will be colored with standard
+ * ANSI escape codes. This is done regardless of whether \a stream refers to a
+ * standard file or a TTY, the caller is responsible for disabling coloring when
+ * not suitable for the log target.
+ *
  * If the function returns an error, the log file is not changed
  *
  * \return Zero on success, or a negative error code otherwise.
  */
-int logSetStream(std::ostream *stream)
+int logSetStream(std::ostream *stream, bool color)
 {
-	return Logger::instance()->logSetStream(stream);
+	return Logger::instance()->logSetStream(stream, color);
 }
 
 /**
@@ -437,14 +497,16 @@ void Logger::backtrace()
 /**
  * \brief Set the log file
  * \param[in] path Full path to the log file
+ * \param[in] color True to output colored messages
  *
  * \sa libcamera::logSetFile()
  *
  * \return Zero on success, or a negative error code otherwise.
  */
-int Logger::logSetFile(const char *path)
+int Logger::logSetFile(const char *path, bool color)
 {
-	std::shared_ptr<LogOutput> output = std::make_shared<LogOutput>(path);
+	std::shared_ptr<LogOutput> output =
+		std::make_shared<LogOutput>(path, color);
 	if (!output->isValid())
 		return -EINVAL;
 
@@ -455,14 +517,16 @@ int Logger::logSetFile(const char *path)
 /**
  * \brief Set the log stream
  * \param[in] stream Stream to send log output to
+ * \param[in] color True to output colored messages
  *
  * \sa libcamera::logSetStream()
  *
  * \return Zero on success, or a negative error code otherwise.
  */
-int Logger::logSetStream(std::ostream *stream)
+int Logger::logSetStream(std::ostream *stream, bool color)
 {
-	std::shared_ptr<LogOutput> output = std::make_shared<LogOutput>(stream);
+	std::shared_ptr<LogOutput> output =
+		std::make_shared<LogOutput>(stream, color);
 	std::atomic_store(&output_, output);
 	return 0;
 }
@@ -477,15 +541,11 @@ int Logger::logSetStream(std::ostream *stream)
  */
 int Logger::logSetTarget(enum LoggingTarget target)
 {
-	std::shared_ptr<LogOutput> output;
-
 	switch (target) {
 	case LoggingTargetSyslog:
-		output = std::make_shared<LogOutput>();
-		std::atomic_store(&output_, output);
+		std::atomic_store(&output_, std::make_shared<LogOutput>());
 		break;
 	case LoggingTargetNone:
-		output = nullptr;
 		std::atomic_store(&output_, std::shared_ptr<LogOutput>());
 		break;
 	default:
@@ -509,7 +569,7 @@ void Logger::logSetLevel(const char *category, const char *level)
 		return;
 
 	for (LogCategory *c : categories_) {
-		if (!strcmp(c->name(), category)) {
+		if (c->name() == category) {
 			c->setSeverity(severity);
 			break;
 		}
@@ -518,9 +578,16 @@ void Logger::logSetLevel(const char *category, const char *level)
 
 /**
  * \brief Construct a logger
+ *
+ * If the environment variable is not set, log to std::cerr. The log messages
+ * are then colored by default. This can be overridden by setting the
+ * LIBCAMERA_LOG_NO_COLOR environment variable to disable coloring.
  */
 Logger::Logger()
 {
+	bool color = !utils::secure_getenv("LIBCAMERA_LOG_NO_COLOR");
+	logSetStream(&std::cerr, color);
+
 	parseLogFile();
 	parseLogLevels();
 }
@@ -531,22 +598,21 @@ Logger::Logger()
  * If the LIBCAMERA_LOG_FILE environment variable is set, open the file it
  * points to and redirect the logger output to it. If the environment variable
  * is set to "syslog", then the logger output will be directed to syslog. Errors
- * are silently ignored and don't affect the logger output (set to stderr).
+ * are silently ignored and don't affect the logger output (set to std::cerr by
+ * default).
  */
 void Logger::parseLogFile()
 {
 	const char *file = utils::secure_getenv("LIBCAMERA_LOG_FILE");
-	if (!file) {
-		logSetStream(&std::cerr);
+	if (!file)
 		return;
-	}
 
 	if (!strcmp(file, "syslog")) {
 		logSetTarget(LoggingTargetSyslog);
 		return;
 	}
 
-	logSetFile(file);
+	logSetFile(file, false);
 }
 
 /**
@@ -642,12 +708,12 @@ LogSeverity Logger::parseLogLevel(const std::string &level)
  * \brief Register a log category with the logger
  * \param[in] category The log category
  *
- * Log categories must have unique names. If a category with the same name
- * already exists this function performs no operation.
+ * Log categories must have unique names. It is invalid to call this function
+ * if a log category with the same name already exists.
  */
 void Logger::registerCategory(LogCategory *category)
 {
-	categories_.insert(category);
+	categories_.push_back(category);
 
 	const std::string &name = category->name();
 	for (const std::pair<std::string, LogSeverity> &level : levels_) {
@@ -669,6 +735,22 @@ void Logger::registerCategory(LogCategory *category)
 			break;
 		}
 	}
+}
+
+/**
+ * \brief Find an existing log category with the given name
+ * \param[in] name Name of the log category
+ * \return The pointer to the found log category or nullptr if not found
+ */
+LogCategory *Logger::findCategory(const char *name) const
+{
+	if (auto it = std::find_if(categories_.begin(), categories_.end(),
+				   [name](auto c) { return c->name() == name; });
+	    it != categories_.end()) {
+		return *it;
+	}
+
+	return nullptr;
 }
 
 /**
@@ -696,13 +778,33 @@ void Logger::registerCategory(LogCategory *category)
  */
 
 /**
+ * \brief Create a new LogCategory or return an existing one
+ * \param[in] name Name of the log category
+ *
+ * Create and return a new LogCategory with the given name if such a category
+ * does not yet exist, or return the existing one.
+ *
+ * \return The pointer to the LogCategory
+ */
+LogCategory *LogCategory::create(const char *name)
+{
+	LogCategory *category = Logger::instance()->findCategory(name);
+
+	if (!category) {
+		category = new LogCategory(name);
+		Logger::instance()->registerCategory(category);
+	}
+
+	return category;
+}
+
+/**
  * \brief Construct a log category
  * \param[in] name The category name
  */
 LogCategory::LogCategory(const char *name)
 	: name_(name), severity_(LogSeverity::LogInfo)
 {
-	Logger::instance()->registerCategory(this);
 }
 
 /**
@@ -739,7 +841,7 @@ void LogCategory::setSeverity(LogSeverity severity)
  */
 const LogCategory &LogCategory::defaultCategory()
 {
-	static const LogCategory *category = new LogCategory("default");
+	static const LogCategory *category = LogCategory::create("default");
 	return *category;
 }
 
@@ -760,14 +862,17 @@ const LogCategory &LogCategory::defaultCategory()
  * will be displayed
  * \param[in] severity The log message severity, controlling how the message
  * will be displayed
+ * \param[in] prefix The log message prefix
  *
  * Create a log message pertaining to line \a line of file \a fileName. The
  * \a severity argument sets the message severity to control whether it will be
- * output or dropped.
+ * output or dropped. The \a prefix optionally identifies the object instance
+ * logging the message.
  */
 LogMessage::LogMessage(const char *fileName, unsigned int line,
-		       const LogCategory &category, LogSeverity severity)
-	: category_(category), severity_(severity)
+		       const LogCategory &category, LogSeverity severity,
+		       const std::string &prefix)
+	: category_(category), severity_(severity), prefix_(prefix)
 {
 	init(fileName, line);
 }
@@ -857,6 +962,12 @@ LogMessage::~LogMessage()
  */
 
 /**
+ * \fn LogMessage::prefix()
+ * \brief Retrieve the prefix of the log message
+ * \return The prefix of the message
+ */
+
+/**
  * \fn LogMessage::msg()
  * \brief Retrieve the message text of the log message
  * \return The message text of the message, as a string
@@ -903,12 +1014,9 @@ Loggable::~Loggable()
 LogMessage Loggable::_log(const LogCategory *category, LogSeverity severity,
 			  const char *fileName, unsigned int line) const
 {
-	LogMessage msg(fileName, line,
-		       category ? *category : LogCategory::defaultCategory(),
-		       severity);
-
-	msg.stream() << logPrefix() << ": ";
-	return msg;
+	return LogMessage(fileName, line,
+			  category ? *category : LogCategory::defaultCategory(),
+			  severity, logPrefix());
 }
 
 /**

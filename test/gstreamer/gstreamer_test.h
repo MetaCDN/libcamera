@@ -10,16 +10,12 @@
 #include <iostream>
 #include <unistd.h>
 
-#include <libcamera/base/utils.h>
-
-#include "libcamera/internal/source_paths.h"
-
 #include <gst/gst.h>
 
 class GstreamerTest
 {
 public:
-	GstreamerTest();
+	GstreamerTest(unsigned int numStreams = 1);
 	virtual ~GstreamerTest();
 
 protected:
@@ -28,7 +24,11 @@ protected:
 	int processEvent();
 	void printError(GstMessage *msg);
 
+	std::string cameraName_;
 	GstElement *pipeline_;
 	GstElement *libcameraSrc_;
 	int status_;
+
+private:
+	bool checkMinCameraStreamsAndSetCameraName(unsigned int numStreams);
 };

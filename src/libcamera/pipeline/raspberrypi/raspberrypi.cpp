@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 /*
- * Copyright (C) 2019-2021, Raspberry Pi (Trading) Ltd.
+ * Copyright (C) 2019-2021, Raspberry Pi Ltd
  *
  * raspberrypi.cpp - Pipeline handler for Raspberry Pi devices
  */
@@ -14,13 +14,13 @@
 #include <unordered_set>
 #include <utility>
 
+#include <libcamera/base/file.h>
 #include <libcamera/base/shared_fd.h>
 #include <libcamera/base/utils.h>
 
 #include <libcamera/camera.h>
 #include <libcamera/control_ids.h>
 #include <libcamera/formats.h>
-#include <libcamera/ipa/raspberrypi.h>
 #include <libcamera/ipa/raspberrypi_ipa_interface.h>
 #include <libcamera/ipa/raspberrypi_ipa_proxy.h>
 #include <libcamera/logging.h>
@@ -33,15 +33,17 @@
 
 #include "libcamera/internal/bayer_format.h"
 #include "libcamera/internal/camera.h"
+#include "libcamera/internal/camera_lens.h"
 #include "libcamera/internal/camera_sensor.h"
-#include "libcamera/internal/delayed_controls.h"
 #include "libcamera/internal/device_enumerator.h"
 #include "libcamera/internal/framebuffer.h"
 #include "libcamera/internal/ipa_manager.h"
 #include "libcamera/internal/media_device.h"
 #include "libcamera/internal/pipeline_handler.h"
 #include "libcamera/internal/v4l2_videodevice.h"
+#include "libcamera/internal/yaml_parser.h"
 
+#include "delayed_controls.h"
 #include "dma_heaps.h"
 #include "rpi_stream.h"
 
@@ -68,6 +70,14 @@ SensorFormats populateSensorFormats(std::unique_ptr<CameraSensor> &sensor)
 	return formats;
 }
 
+bool isMonoSensor(std::unique_ptr<CameraSensor> &sensor)
+{
+	unsigned int mbusCode = sensor->mbusCodes()[0];
+	const BayerFormat &bayer = BayerFormat::fromMbusCode(mbusCode);
+
+	return bayer.order == BayerFormat::Order::MONO;
+}
+
 PixelFormat mbusCodeToPixelFormat(unsigned int mbus_code,
 				  BayerFormat::Packing packingReq)
 {
@@ -91,13 +101,14 @@ PixelFormat mbusCodeToPixelFormat(unsigned int mbus_code,
 	return pix;
 }
 
-V4L2DeviceFormat toV4L2DeviceFormat(const V4L2SubdeviceFormat &format,
+V4L2DeviceFormat toV4L2DeviceFormat(const V4L2VideoDevice *dev,
+				    const V4L2SubdeviceFormat &format,
 				    BayerFormat::Packing packingReq)
 {
 	const PixelFormat pix = mbusCodeToPixelFormat(format.mbus_code, packingReq);
 	V4L2DeviceFormat deviceFormat;
 
-	deviceFormat.fourcc = V4L2PixelFormat::fromPixelFormat(pix);
+	deviceFormat.fourcc = dev->toV4L2PixelFormat(pix);
 	deviceFormat.size = format.size;
 	deviceFormat.colorSpace = format.colorSpace;
 	return deviceFormat;
@@ -105,18 +116,8 @@ V4L2DeviceFormat toV4L2DeviceFormat(const V4L2SubdeviceFormat &format,
 
 bool isRaw(const PixelFormat &pixFmt)
 {
-	/*
-	 * The isRaw test might be redundant right now the pipeline handler only
-	 * supports RAW sensors. Leave it in for now, just as a sanity check.
-	 */
-	if (!pixFmt.isValid())
-		return false;
-
-	const PixelFormatInfo &info = PixelFormatInfo::info(pixFmt);
-	if (!info.isValid())
-		return false;
-
-	return info.colourEncoding == PixelFormatInfo::ColourEncodingRAW;
+	/* This test works for both Bayer and raw mono formats. */
+	return BayerFormat::fromPixelFormat(pixFmt).isValid();
 }
 
 double scoreFormat(double desired, double actual)
@@ -186,8 +187,8 @@ class RPiCameraData : public Camera::Private
 public:
 	RPiCameraData(PipelineHandler *pipe)
 		: Camera::Private(pipe), state_(State::Stopped),
-		  supportsFlips_(false), flipsAlterBayerOrder_(false),
-		  dropFrameCount_(0), buffersAllocated_(false), ispOutputCount_(0)
+		  flipsAlterBayerOrder_(false), dropFrameCount_(0),
+		  buffersAllocated_(false), ispOutputCount_(0)
 	{
 	}
 
@@ -199,8 +200,9 @@ public:
 	void freeBuffers();
 	void frameStarted(uint32_t sequence);
 
-	int loadIPA(ipa::RPi::SensorConfig *sensorConfig);
+	int loadIPA(ipa::RPi::IPAInitResult *result);
 	int configureIPA(const CameraConfiguration *config, ipa::RPi::IPAConfigResult *result);
+	int loadPipelineConfiguration();
 
 	void enumerateVideoDevices(MediaLink *link);
 
@@ -208,7 +210,8 @@ public:
 	void runIsp(uint32_t bufferId);
 	void embeddedComplete(uint32_t bufferId);
 	void setIspControls(const ControlList &controls);
-	void setDelayedControls(const ControlList &controls);
+	void setDelayedControls(const ControlList &controls, uint32_t delayContext);
+	void setLensControls(const ControlList &controls);
 	void setSensorControls(ControlList &controls);
 	void unicamTimeout();
 
@@ -245,7 +248,7 @@ public:
 	RPi::DmaHeap dmaHeap_;
 	SharedFD lsTable_;
 
-	std::unique_ptr<DelayedControls> delayedCtrls_;
+	std::unique_ptr<RPi::DelayedControls> delayedCtrls_;
 	bool sensorMetadata_;
 
 	/*
@@ -253,12 +256,18 @@ public:
 	 * thread. So, we do not need to have any mutex to protect access to any
 	 * of the variables below.
 	 */
-	enum class State { Stopped, Idle, Busy, IpaComplete };
+	enum class State { Stopped, Idle, Busy, IpaComplete, Error };
 	State state_;
+
+	bool isRunning()
+	{
+		return state_ != State::Stopped && state_ != State::Error;
+	}
 
 	struct BayerFrame {
 		FrameBuffer *buffer;
 		ControlList controls;
+		unsigned int delayContext;
 	};
 
 	std::queue<BayerFrame> bayerQueue_;
@@ -266,11 +275,9 @@ public:
 	std::deque<Request *> requestQueue_;
 
 	/*
-	 * Manage horizontal and vertical flips supported (or not) by the
-	 * sensor. Also store the "native" Bayer order (that is, with no
-	 * transforms applied).
+	 * Store the "native" Bayer order (that is, with no transforms
+	 * applied).
 	 */
-	bool supportsFlips_;
 	bool flipsAlterBayerOrder_;
 	BayerFormat::Order nativeBayerOrder_;
 
@@ -291,6 +298,30 @@ public:
 	/* Have internal buffers been allocated? */
 	bool buffersAllocated_;
 
+	struct Config {
+		/*
+		 * The minimum number of internal buffers to be allocated for
+		 * the Unicam Image stream.
+		 */
+		unsigned int minUnicamBuffers;
+		/*
+		 * The minimum total (internal + external) buffer count used for
+		 * the Unicam Image stream.
+		 *
+		 * Note that:
+		 * minTotalUnicamBuffers must be >= 1, and
+		 * minTotalUnicamBuffers >= minUnicamBuffers
+		 */
+		unsigned int minTotalUnicamBuffers;
+		/*
+		 * Override any request from the IPA to drop a number of startup
+		 * frames.
+		 */
+		bool disableStartupFrameDrops;
+	};
+
+	Config config_;
+
 private:
 	void checkRequestCompleted();
 	void fillRequestMetadata(const ControlList &bufferControls,
@@ -306,6 +337,7 @@ class RPiCameraConfiguration : public CameraConfiguration
 public:
 	RPiCameraConfiguration(const RPiCameraData *data);
 
+	CameraConfiguration::Status validateColorSpaces(ColorSpaceFlags flags);
 	Status validate() override;
 
 	/* Cache the combinedTransform_ that will be applied to the sensor */
@@ -313,6 +345,14 @@ public:
 
 private:
 	const RPiCameraData *data_;
+
+	/*
+	 * Store the colour spaces that all our streams will have. RGB format streams
+	 * will have the same colorspace as YUV streams, with YCbCr field cleared and
+	 * range set to full.
+         */
+	std::optional<ColorSpace> yuvColorSpace_;
+	std::optional<ColorSpace> rgbColorSpace_;
 };
 
 class PipelineHandlerRPi : public PipelineHandler
@@ -320,7 +360,8 @@ class PipelineHandlerRPi : public PipelineHandler
 public:
 	PipelineHandlerRPi(CameraManager *manager);
 
-	CameraConfiguration *generateConfiguration(Camera *camera, const StreamRoles &roles) override;
+	std::unique_ptr<CameraConfiguration> generateConfiguration(Camera *camera,
+		const StreamRoles &roles) override;
 	int configure(Camera *camera, CameraConfiguration *config) override;
 
 	int exportFrameBuffers(Camera *camera, Stream *stream,
@@ -332,6 +373,8 @@ public:
 	int queueRequestDevice(Camera *camera, Request *request) override;
 
 	bool match(DeviceEnumerator *enumerator) override;
+
+	void releaseDevice(Camera *camera) override;
 
 private:
 	RPiCameraData *cameraData(Camera *camera)
@@ -350,6 +393,105 @@ RPiCameraConfiguration::RPiCameraConfiguration(const RPiCameraData *data)
 {
 }
 
+static const std::vector<ColorSpace> validColorSpaces = {
+	ColorSpace::Sycc,
+	ColorSpace::Smpte170m,
+	ColorSpace::Rec709
+};
+
+static std::optional<ColorSpace> findValidColorSpace(const ColorSpace &colourSpace)
+{
+	for (auto cs : validColorSpaces) {
+		if (colourSpace.primaries == cs.primaries &&
+		    colourSpace.transferFunction == cs.transferFunction)
+			return cs;
+	}
+
+	return std::nullopt;
+}
+
+static bool isRgb(const PixelFormat &pixFmt)
+{
+	const PixelFormatInfo &info = PixelFormatInfo::info(pixFmt);
+	return info.colourEncoding == PixelFormatInfo::ColourEncodingRGB;
+}
+
+static bool isYuv(const PixelFormat &pixFmt)
+{
+	/* The code below would return true for raw mono streams, so weed those out first. */
+	if (isRaw(pixFmt))
+		return false;
+
+	const PixelFormatInfo &info = PixelFormatInfo::info(pixFmt);
+	return info.colourEncoding == PixelFormatInfo::ColourEncodingYUV;
+}
+
+/*
+ * Raspberry Pi drivers expect the following colour spaces:
+ * - V4L2_COLORSPACE_RAW for raw streams.
+ * - One of V4L2_COLORSPACE_JPEG, V4L2_COLORSPACE_SMPTE170M, V4L2_COLORSPACE_REC709 for
+ *   non-raw streams. Other fields such as transfer function, YCbCr encoding and
+ *   quantisation are not used.
+ *
+ * The libcamera colour spaces that we wish to use corresponding to these are therefore:
+ * - ColorSpace::Raw for V4L2_COLORSPACE_RAW
+ * - ColorSpace::Sycc for V4L2_COLORSPACE_JPEG
+ * - ColorSpace::Smpte170m for V4L2_COLORSPACE_SMPTE170M
+ * - ColorSpace::Rec709 for V4L2_COLORSPACE_REC709
+ */
+
+CameraConfiguration::Status RPiCameraConfiguration::validateColorSpaces([[maybe_unused]] ColorSpaceFlags flags)
+{
+	Status status = Valid;
+	yuvColorSpace_.reset();
+
+	for (auto cfg : config_) {
+		/* First fix up raw streams to have the "raw" colour space. */
+		if (isRaw(cfg.pixelFormat)) {
+			/* If there was no value here, that doesn't count as "adjusted". */
+			if (cfg.colorSpace && cfg.colorSpace != ColorSpace::Raw) {
+				status = Adjusted;
+				cfg.colorSpace = ColorSpace::Raw;
+			}
+			continue;
+		}
+
+		/* Next we need to find our shared colour space. The first valid one will do. */
+		if (cfg.colorSpace && !yuvColorSpace_)
+			yuvColorSpace_ = findValidColorSpace(cfg.colorSpace.value());
+	}
+
+	/* If no colour space was given anywhere, choose sYCC. */
+	if (!yuvColorSpace_)
+		yuvColorSpace_ = ColorSpace::Sycc;
+
+	/* Note the version of this that any RGB streams will have to use. */
+	rgbColorSpace_ = yuvColorSpace_;
+	rgbColorSpace_->ycbcrEncoding = ColorSpace::YcbcrEncoding::None;
+	rgbColorSpace_->range = ColorSpace::Range::Full;
+
+	/* Go through the streams again and force everyone to the same colour space. */
+	for (auto cfg : config_) {
+		if (cfg.colorSpace == ColorSpace::Raw)
+			continue;
+
+		if (isYuv(cfg.pixelFormat) && cfg.colorSpace != yuvColorSpace_) {
+			/* Again, no value means "not adjusted". */
+			if (cfg.colorSpace)
+				status = Adjusted;
+			cfg.colorSpace = yuvColorSpace_;
+		}
+		if (isRgb(cfg.pixelFormat) && cfg.colorSpace != rgbColorSpace_) {
+			/* Be nice, and let the YUV version count as non-adjusted too. */
+			if (cfg.colorSpace && cfg.colorSpace != yuvColorSpace_)
+				status = Adjusted;
+			cfg.colorSpace = rgbColorSpace_;
+		}
+	}
+
+	return status;
+}
+
 CameraConfiguration::Status RPiCameraConfiguration::validate()
 {
 	Status status = Valid;
@@ -360,59 +502,14 @@ CameraConfiguration::Status RPiCameraConfiguration::validate()
 	status = validateColorSpaces(ColorSpaceFlag::StreamsShareColorSpace);
 
 	/*
-	 * What if the platform has a non-90 degree rotation? We can't even
-	 * "adjust" the configuration and carry on. Alternatively, raising an
-	 * error means the platform can never run. Let's just print a warning
-	 * and continue regardless; the rotation is effectively set to zero.
+	 * Validate the requested transform against the sensor capabilities and
+	 * rotation and store the final combined transform that configure() will
+	 * need to apply to the sensor to save us working it out again.
 	 */
-	int32_t rotation = data_->sensor_->properties().get(properties::Rotation);
-	bool success;
-	Transform rotationTransform = transformFromRotation(rotation, &success);
-	if (!success)
-		LOG(RPI, Warning) << "Invalid rotation of " << rotation
-				  << " degrees - ignoring";
-	Transform combined = transform * rotationTransform;
-
-	/*
-	 * We combine the platform and user transform, but must "adjust away"
-	 * any combined result that includes a transform, as we can't do those.
-	 * In this case, flipping only the transpose bit is helpful to
-	 * applications - they either get the transform they requested, or have
-	 * to do a simple transpose themselves (they don't have to worry about
-	 * the other possible cases).
-	 */
-	if (!!(combined & Transform::Transpose)) {
-		/*
-		 * Flipping the transpose bit in "transform" flips it in the
-		 * combined result too (as it's the last thing that happens),
-		 * which is of course clearing it.
-		 */
-		transform ^= Transform::Transpose;
-		combined &= ~Transform::Transpose;
+	Transform requestedTransform = transform;
+	combinedTransform_ = data_->sensor_->validateTransform(&transform);
+	if (transform != requestedTransform)
 		status = Adjusted;
-	}
-
-	/*
-	 * We also check if the sensor doesn't do h/vflips at all, in which
-	 * case we clear them, and the application will have to do everything.
-	 */
-	if (!data_->supportsFlips_ && !!combined) {
-		/*
-		 * If the sensor can do no transforms, then combined must be
-		 * changed to the identity. The only user transform that gives
-		 * rise to this the inverse of the rotation. (Recall that
-		 * combined = transform * rotationTransform.)
-		 */
-		transform = -rotationTransform;
-		combined = Transform::Identity;
-		status = Adjusted;
-	}
-
-	/*
-	 * Store the final combined transform that configure() will need to
-	 * apply to the sensor to save us working it out again.
-	 */
-	combinedTransform_ = combined;
 
 	unsigned int rawCount = 0, outCount = 0, count = 0, maxIndex = 0;
 	std::pair<int, Size> outSize[2];
@@ -423,15 +520,15 @@ CameraConfiguration::Status RPiCameraConfiguration::validate()
 			 * Calculate the best sensor mode we can use based on
 			 * the user request.
 			 */
+			V4L2VideoDevice *unicam = data_->unicam_[Unicam::Image].dev();
 			const PixelFormatInfo &info = PixelFormatInfo::info(cfg.pixelFormat);
 			unsigned int bitDepth = info.isValid() ? info.bitsPerPixel : defaultRawBitDepth;
 			V4L2SubdeviceFormat sensorFormat = findBestFormat(data_->sensorFormats_, cfg.size, bitDepth);
 			BayerFormat::Packing packing = BayerFormat::Packing::CSI2;
 			if (info.isValid() && !info.packed)
 				packing = BayerFormat::Packing::None;
-			V4L2DeviceFormat unicamFormat = toV4L2DeviceFormat(sensorFormat,
-									   packing);
-			int ret = data_->unicam_[Unicam::Image].dev()->tryFormat(&unicamFormat);
+			V4L2DeviceFormat unicamFormat = toV4L2DeviceFormat(unicam, sensorFormat, packing);
+			int ret = unicam->tryFormat(&unicamFormat);
 			if (ret)
 				return Invalid;
 
@@ -447,7 +544,7 @@ CameraConfiguration::Status RPiCameraConfiguration::validate()
 			if (data_->flipsAlterBayerOrder_) {
 				BayerFormat bayer = BayerFormat::fromV4L2PixelFormat(fourcc);
 				bayer.order = data_->nativeBayerOrder_;
-				bayer = bayer.transform(combined);
+				bayer = bayer.transform(combinedTransform_);
 				fourcc = bayer.toV4L2PixelFormat();
 			}
 
@@ -517,16 +614,17 @@ CameraConfiguration::Status RPiCameraConfiguration::validate()
 
 		V4L2VideoDevice::Formats fmts = dev->formats();
 
-		if (fmts.find(V4L2PixelFormat::fromPixelFormat(cfgPixFmt)) == fmts.end()) {
+		if (fmts.find(dev->toV4L2PixelFormat(cfgPixFmt)) == fmts.end()) {
 			/* If we cannot find a native format, use a default one. */
 			cfgPixFmt = formats::NV12;
 			status = Adjusted;
 		}
 
 		V4L2DeviceFormat format;
-		format.fourcc = V4L2PixelFormat::fromPixelFormat(cfg.pixelFormat);
+		format.fourcc = dev->toV4L2PixelFormat(cfg.pixelFormat);
 		format.size = cfg.size;
-		format.colorSpace = cfg.colorSpace;
+		/* We want to send the associated YCbCr info through to the driver. */
+		format.colorSpace = yuvColorSpace_;
 
 		LOG(RPI, Debug)
 			<< "Try color space " << ColorSpace::toString(cfg.colorSpace);
@@ -535,6 +633,11 @@ CameraConfiguration::Status RPiCameraConfiguration::validate()
 		if (ret)
 			return Invalid;
 
+		/*
+		 * But for RGB streams, the YCbCr info gets overwritten on the way back
+		 * so we must check against what the stream cfg says, not what we actually
+		 * requested (which carefully included the YCbCr info)!
+		 */
 		if (cfg.colorSpace != format.colorSpace) {
 			status = Adjusted;
 			LOG(RPI, Debug)
@@ -558,11 +661,12 @@ PipelineHandlerRPi::PipelineHandlerRPi(CameraManager *manager)
 {
 }
 
-CameraConfiguration *PipelineHandlerRPi::generateConfiguration(Camera *camera,
-							       const StreamRoles &roles)
+std::unique_ptr<CameraConfiguration>
+PipelineHandlerRPi::generateConfiguration(Camera *camera, const StreamRoles &roles)
 {
 	RPiCameraData *data = cameraData(camera);
-	CameraConfiguration *config = new RPiCameraConfiguration(data);
+	std::unique_ptr<CameraConfiguration> config =
+		std::make_unique<RPiCameraConfiguration>(data);
 	V4L2SubdeviceFormat sensorFormat;
 	unsigned int bufferCount;
 	PixelFormat pixelFormat;
@@ -593,11 +697,11 @@ CameraConfiguration *PipelineHandlerRPi::generateConfiguration(Camera *camera,
 			fmts = data->isp_[Isp::Output0].dev()->formats();
 			pixelFormat = formats::NV12;
 			/*
-			 * Still image codecs usually expect the JPEG color space.
+			 * Still image codecs usually expect the sYCC color space.
 			 * Even RGB codecs will be fine as the RGB we get with the
-			 * JPEG color space is the same as sRGB.
+			 * sYCC color space is the same as sRGB.
 			 */
-			colorSpace = ColorSpace::Jpeg;
+			colorSpace = ColorSpace::Sycc;
 			/* Return the largest sensor resolution. */
 			size = sensorSize;
 			bufferCount = 1;
@@ -628,7 +732,7 @@ CameraConfiguration *PipelineHandlerRPi::generateConfiguration(Camera *camera,
 		case StreamRole::Viewfinder:
 			fmts = data->isp_[Isp::Output0].dev()->formats();
 			pixelFormat = formats::ARGB8888;
-			colorSpace = ColorSpace::Jpeg;
+			colorSpace = ColorSpace::Sycc;
 			size = { 800, 600 };
 			bufferCount = 4;
 			outCount++;
@@ -637,13 +741,11 @@ CameraConfiguration *PipelineHandlerRPi::generateConfiguration(Camera *camera,
 		default:
 			LOG(RPI, Error) << "Requested stream role not supported: "
 					<< role;
-			delete config;
 			return nullptr;
 		}
 
 		if (rawCount > 1 || outCount > 2) {
 			LOG(RPI, Error) << "Invalid stream roles requested";
-			delete config;
 			return nullptr;
 		}
 
@@ -731,29 +833,19 @@ int PipelineHandlerRPi::configure(Camera *camera, CameraConfiguration *config)
 	}
 
 	/*
-	 * Configure the H/V flip controls based on the combination of
-	 * the sensor and user transform.
+	 * Calculate the best sensor mode we can use based on the user's
+	 * request, and apply it to the sensor with the cached transform, if
+	 * any.
 	 */
-	if (data->supportsFlips_) {
-		const RPiCameraConfiguration *rpiConfig =
-			static_cast<const RPiCameraConfiguration *>(config);
-		ControlList controls;
-
-		controls.set(V4L2_CID_HFLIP,
-			     static_cast<int32_t>(!!(rpiConfig->combinedTransform_ & Transform::HFlip)));
-		controls.set(V4L2_CID_VFLIP,
-			     static_cast<int32_t>(!!(rpiConfig->combinedTransform_ & Transform::VFlip)));
-		data->setSensorControls(controls);
-	}
-
-	/* First calculate the best sensor mode we can use based on the user request. */
 	V4L2SubdeviceFormat sensorFormat = findBestFormat(data->sensorFormats_, rawStream ? sensorSize : maxSize, bitDepth);
-	ret = data->sensor_->setFormat(&sensorFormat);
+	const RPiCameraConfiguration *rpiConfig = static_cast<const RPiCameraConfiguration *>(config);
+	ret = data->sensor_->setFormat(&sensorFormat, rpiConfig->combinedTransform_);
 	if (ret)
 		return ret;
 
-	V4L2DeviceFormat unicamFormat = toV4L2DeviceFormat(sensorFormat, packing);
-	ret = data->unicam_[Unicam::Image].dev()->setFormat(&unicamFormat);
+	V4L2VideoDevice *unicam = data->unicam_[Unicam::Image].dev();
+	V4L2DeviceFormat unicamFormat = toV4L2DeviceFormat(unicam, sensorFormat, packing);
+	ret = unicam->setFormat(&unicamFormat);
 	if (ret)
 		return ret;
 
@@ -784,7 +876,7 @@ int PipelineHandlerRPi::configure(Camera *camera, CameraConfiguration *config)
 		RPi::Stream *stream = i == maxIndex ? &data->isp_[Isp::Output0]
 						    : &data->isp_[Isp::Output1];
 
-		V4L2PixelFormat fourcc = V4L2PixelFormat::fromPixelFormat(cfg.pixelFormat);
+		V4L2PixelFormat fourcc = stream->dev()->toV4L2PixelFormat(cfg.pixelFormat);
 		format.size = cfg.size;
 		format.fourcc = fourcc;
 		format.colorSpace = cfg.colorSpace;
@@ -827,13 +919,15 @@ int PipelineHandlerRPi::configure(Camera *camera, CameraConfiguration *config)
 	 * statistics coming from the hardware.
 	 */
 	if (!output0Set) {
+		V4L2VideoDevice *dev = data->isp_[Isp::Output0].dev();
+
 		maxSize = Size(320, 240);
 		format = {};
 		format.size = maxSize;
-		format.fourcc = V4L2PixelFormat::fromPixelFormat(formats::YUV420);
+		format.fourcc = dev->toV4L2PixelFormat(formats::YUV420);
 		/* No one asked for output, so the color space doesn't matter. */
-		format.colorSpace = ColorSpace::Jpeg;
-		ret = data->isp_[Isp::Output0].dev()->setFormat(&format);
+		format.colorSpace = ColorSpace::Sycc;
+		ret = dev->setFormat(&format);
 		if (ret) {
 			LOG(RPI, Error)
 				<< "Failed to set default format on ISP Output0: "
@@ -857,18 +951,20 @@ int PipelineHandlerRPi::configure(Camera *camera, CameraConfiguration *config)
 	 * colour denoise will not run.
 	 */
 	if (!output1Set) {
+		V4L2VideoDevice *dev = data->isp_[Isp::Output1].dev();
+
 		V4L2DeviceFormat output1Format;
 		constexpr Size maxDimensions(1200, 1200);
 		const Size limit = maxDimensions.boundedToAspectRatio(format.size);
 
 		output1Format.size = (format.size / 2).boundedTo(limit).alignedDownTo(2, 2);
 		output1Format.colorSpace = format.colorSpace;
-		output1Format.fourcc = V4L2PixelFormat::fromPixelFormat(formats::YUV420);
+		output1Format.fourcc = dev->toV4L2PixelFormat(formats::YUV420);
 
 		LOG(RPI, Debug) << "Setting ISP Output1 (internal) to "
 				<< output1Format;
 
-		ret = data->isp_[Isp::Output1].dev()->setFormat(&output1Format);
+		ret = dev->setFormat(&output1Format);
 		if (ret) {
 			LOG(RPI, Error) << "Failed to set format on ISP Output1: "
 					<< ret;
@@ -894,6 +990,7 @@ int PipelineHandlerRPi::configure(Camera *camera, CameraConfiguration *config)
 	/* Adjust aspect ratio by providing crops on the input image. */
 	Size size = unicamFormat.size.boundedToAspectRatio(maxSize);
 	Rectangle crop = size.centeredTo(Rectangle(unicamFormat.size).center());
+	Rectangle defaultCrop = crop;
 	data->ispCrop_ = crop;
 
 	data->isp_[Isp::Input].dev()->setSelection(V4L2_SEL_TGT_CROP, &crop);
@@ -940,6 +1037,18 @@ int PipelineHandlerRPi::configure(Camera *camera, CameraConfiguration *config)
 
 	/* Store the mode sensitivity for the application. */
 	data->properties_.set(properties::SensorSensitivity, result.modeSensitivity);
+
+	/* Update the controls that the Raspberry Pi IPA can handle. */
+	ControlInfoMap::Map ctrlMap;
+	for (auto const &c : result.controlInfo)
+		ctrlMap.emplace(c.first, c.second);
+
+	/* Add the ScalerCrop control limits based on the current mode. */
+	Rectangle ispMinCrop = data->scaleIspCrop(Rectangle(data->ispMinCropSize_));
+	defaultCrop = data->scaleIspCrop(defaultCrop);
+	ctrlMap[&controls::ScalerCrop] = ControlInfo(ispMinCrop, data->sensorInfo_.analogCrop, defaultCrop);
+
+	data->controlInfo_ = ControlInfoMap(std::move(ctrlMap), result.controlInfo.idmap());
 
 	/* Setup the Video Mux/Bridge entities. */
 	for (auto &[device, link] : data->bridgeDevices_) {
@@ -998,21 +1107,6 @@ int PipelineHandlerRPi::start(Camera *camera, const ControlList *controls)
 	RPiCameraData *data = cameraData(camera);
 	int ret;
 
-	for (auto const stream : data->streams_)
-		stream->resetBuffers();
-
-	if (!data->buffersAllocated_) {
-		/* Allocate buffers for internal pipeline usage. */
-		ret = prepareBuffers(camera);
-		if (ret) {
-			LOG(RPI, Error) << "Failed to allocate buffers";
-			data->freeBuffers();
-			stop(camera);
-			return ret;
-		}
-		data->buffersAllocated_ = true;
-	}
-
 	/* Check if a ScalerCrop control was specified. */
 	if (controls)
 		data->applyScalerCrop(*controls);
@@ -1027,7 +1121,23 @@ int PipelineHandlerRPi::start(Camera *camera, const ControlList *controls)
 		data->setSensorControls(startConfig.controls);
 
 	/* Configure the number of dropped frames required on startup. */
-	data->dropFrameCount_ = startConfig.dropFrameCount;
+	data->dropFrameCount_ = data->config_.disableStartupFrameDrops
+			      ? 0 : startConfig.dropFrameCount;
+
+	for (auto const stream : data->streams_)
+		stream->resetBuffers();
+
+	if (!data->buffersAllocated_) {
+		/* Allocate buffers for internal pipeline usage. */
+		ret = prepareBuffers(camera);
+		if (ret) {
+			LOG(RPI, Error) << "Failed to allocate buffers";
+			data->freeBuffers();
+			stop(camera);
+			return ret;
+		}
+		data->buffersAllocated_ = true;
+	}
 
 	/* We need to set the dropFrameCount_ before queueing buffers. */
 	ret = queueAllBuffers(camera);
@@ -1044,7 +1154,7 @@ int PipelineHandlerRPi::start(Camera *camera, const ControlList *controls)
 	 * Reset the delayed controls with the gain and exposure values set by
 	 * the IPA.
 	 */
-	data->delayedCtrls_->reset();
+	data->delayedCtrls_->reset(0);
 
 	data->state_ = RPiCameraData::State::Idle;
 
@@ -1092,7 +1202,7 @@ int PipelineHandlerRPi::queueRequestDevice(Camera *camera, Request *request)
 {
 	RPiCameraData *data = cameraData(camera);
 
-	if (data->state_ == RPiCameraData::State::Stopped)
+	if (!data->isRunning())
 		return -EINVAL;
 
 	LOG(RPI, Debug) << "queueRequestDevice: New request.";
@@ -1111,6 +1221,7 @@ int PipelineHandlerRPi::queueRequestDevice(Camera *camera, Request *request)
 			 */
 			stream->setExternalBuffer(buffer);
 		}
+
 		/*
 		 * If no buffer is provided by the request for this stream, we
 		 * queue a nullptr to the stream to signify that it must use an
@@ -1173,6 +1284,12 @@ bool PipelineHandlerRPi::match(DeviceEnumerator *enumerator)
 	return !!numCameras;
 }
 
+void PipelineHandlerRPi::releaseDevice(Camera *camera)
+{
+	RPiCameraData *data = cameraData(camera);
+	data->freeBuffers();
+}
+
 int PipelineHandlerRPi::registerCamera(MediaDevice *unicam, MediaDevice *isp, MediaEntity *sensorEntity)
 {
 	std::unique_ptr<RPiCameraData> data = std::make_unique<RPiCameraData>(this);
@@ -1231,15 +1348,15 @@ int PipelineHandlerRPi::registerCamera(MediaDevice *unicam, MediaDevice *isp, Me
 
 	data->sensorFormats_ = populateSensorFormats(data->sensor_);
 
-	ipa::RPi::SensorConfig sensorConfig;
-	if (data->loadIPA(&sensorConfig)) {
+	ipa::RPi::IPAInitResult result;
+	if (data->loadIPA(&result)) {
 		LOG(RPI, Error) << "Failed to load a suitable IPA library";
 		return -EINVAL;
 	}
 
-	if (sensorConfig.sensorMetadata ^ !!unicamEmbedded) {
+	if (result.sensorConfig.sensorMetadata ^ !!unicamEmbedded) {
 		LOG(RPI, Warning) << "Mismatch between Unicam and CamHelper for embedded data usage!";
-		sensorConfig.sensorMetadata = false;
+		result.sensorConfig.sensorMetadata = false;
 		if (unicamEmbedded)
 			data->unicam_[Unicam::Embedded].dev()->bufferReady.disconnect();
 	}
@@ -1253,7 +1370,7 @@ int PipelineHandlerRPi::registerCamera(MediaDevice *unicam, MediaDevice *isp, Me
 	 * iterate over all streams in one go.
 	 */
 	data->streams_.push_back(&data->unicam_[Unicam::Image]);
-	if (sensorConfig.sensorMetadata)
+	if (result.sensorConfig.sensorMetadata)
 		data->streams_.push_back(&data->unicam_[Unicam::Embedded]);
 
 	for (auto &stream : data->isp_)
@@ -1274,16 +1391,18 @@ int PipelineHandlerRPi::registerCamera(MediaDevice *unicam, MediaDevice *isp, Me
 	 * Setup our delayed control writer with the sensor default
 	 * gain and exposure delays. Mark VBLANK for priority write.
 	 */
-	std::unordered_map<uint32_t, DelayedControls::ControlParams> params = {
-		{ V4L2_CID_ANALOGUE_GAIN, { sensorConfig.gainDelay, false } },
-		{ V4L2_CID_EXPOSURE, { sensorConfig.exposureDelay, false } },
-		{ V4L2_CID_VBLANK, { sensorConfig.vblankDelay, true } }
+	std::unordered_map<uint32_t, RPi::DelayedControls::ControlParams> params = {
+		{ V4L2_CID_ANALOGUE_GAIN, { result.sensorConfig.gainDelay, false } },
+		{ V4L2_CID_EXPOSURE, { result.sensorConfig.exposureDelay, false } },
+		{ V4L2_CID_HBLANK, { result.sensorConfig.hblankDelay, false } },
+		{ V4L2_CID_VBLANK, { result.sensorConfig.vblankDelay, true } }
 	};
-	data->delayedCtrls_ = std::make_unique<DelayedControls>(data->sensor_->device(), params);
-	data->sensorMetadata_ = sensorConfig.sensorMetadata;
+	data->delayedCtrls_ = std::make_unique<RPi::DelayedControls>(data->sensor_->device(), params);
+	data->sensorMetadata_ = result.sensorConfig.sensorMetadata;
 
-	/* Register the controls that the Raspberry Pi IPA can handle. */
-	data->controlInfo_ = RPi::Controls;
+	/* Register initial controls that the Raspberry Pi IPA can handle. */
+	data->controlInfo_ = std::move(result.controlInfo);
+
 	/* Initialize the camera properties. */
 	data->properties_ = data->sensor_->properties();
 
@@ -1304,13 +1423,10 @@ int PipelineHandlerRPi::registerCamera(MediaDevice *unicam, MediaDevice *isp, Me
 	data->properties_.set(properties::ScalerCropMaximum, Rectangle{});
 
 	/*
-	 * We cache three things about the sensor in relation to transforms
-	 * (meaning horizontal and vertical flips).
-	 *
-	 * Firstly, does it support them?
-	 * Secondly, if you use them does it affect the Bayer ordering?
-	 * Thirdly, what is the "native" Bayer order, when no transforms are
-	 * applied?
+	 * We cache two things about the sensor in relation to transforms
+	 * (meaning horizontal and vertical flips): if they affect the Bayer
+	 * ordering, and what the "native" Bayer order is, when no transforms
+	 * are applied.
 	 *
 	 * We note that the sensor's cached list of supported formats is
 	 * already in the "native" order, with any flips having been undone.
@@ -1319,7 +1435,6 @@ int PipelineHandlerRPi::registerCamera(MediaDevice *unicam, MediaDevice *isp, Me
 	const struct v4l2_query_ext_ctrl *hflipCtrl = sensor->controlInfo(V4L2_CID_HFLIP);
 	if (hflipCtrl) {
 		/* We assume it will support vflips too... */
-		data->supportsFlips_ = true;
 		data->flipsAlterBayerOrder_ = hflipCtrl->flags & V4L2_CTRL_FLAG_MODIFY_LAYOUT;
 	}
 
@@ -1346,6 +1461,12 @@ int PipelineHandlerRPi::registerCamera(MediaDevice *unicam, MediaDevice *isp, Me
 	streams.insert(&data->unicam_[Unicam::Image]);
 	streams.insert(&data->isp_[Isp::Output0]);
 	streams.insert(&data->isp_[Isp::Output1]);
+
+	int ret = data->loadPipelineConfiguration();
+	if (ret) {
+		LOG(RPI, Error) << "Unable to load pipeline configuration";
+		return ret;
+	}
 
 	/* Create and register the camera. */
 	const std::string &id = data->sensor_->id();
@@ -1409,25 +1530,28 @@ int PipelineHandlerRPi::prepareBuffers(Camera *camera)
 	for (auto const stream : data->streams_) {
 		unsigned int numBuffers;
 		/*
-		 * For Unicam, allocate a minimum of 4 buffers as we want
-		 * to avoid any frame drops.
+		 * For Unicam, allocate a minimum number of buffers for internal
+		 * use as we want to avoid any frame drops.
 		 */
-		constexpr unsigned int minBuffers = 4;
+		const unsigned int minBuffers = data->config_.minTotalUnicamBuffers;
 		if (stream == &data->unicam_[Unicam::Image]) {
 			/*
 			 * If an application has configured a RAW stream, allocate
 			 * additional buffers to make up the minimum, but ensure
-			 * we have at least 2 sets of internal buffers to use to
-			 * minimise frame drops.
+			 * we have at least minUnicamBuffers of internal buffers
+			 * to use to minimise frame drops.
 			 */
-			numBuffers = std::max<int>(2, minBuffers - numRawBuffers);
+			numBuffers = std::max<int>(data->config_.minUnicamBuffers,
+						   minBuffers - numRawBuffers);
 		} else if (stream == &data->isp_[Isp::Input]) {
 			/*
 			 * ISP input buffers are imported from Unicam, so follow
 			 * similar logic as above to count all the RAW buffers
 			 * available.
 			 */
-			numBuffers = numRawBuffers + std::max<int>(2, minBuffers - numRawBuffers);
+			numBuffers = numRawBuffers +
+				     std::max<int>(data->config_.minUnicamBuffers,
+						   minBuffers - numRawBuffers);
 
 		} else if (stream == &data->unicam_[Unicam::Embedded]) {
 			/*
@@ -1454,10 +1578,10 @@ int PipelineHandlerRPi::prepareBuffers(Camera *camera)
 	 * Pass the stats and embedded data buffers to the IPA. No other
 	 * buffers need to be passed.
 	 */
-	mapBuffers(camera, data->isp_[Isp::Stats].getBuffers(), ipa::RPi::MaskStats);
+	mapBuffers(camera, data->isp_[Isp::Stats].getBuffers(), RPi::MaskStats);
 	if (data->sensorMetadata_)
 		mapBuffers(camera, data->unicam_[Unicam::Embedded].getBuffers(),
-			   ipa::RPi::MaskEmbeddedData);
+			   RPi::MaskEmbeddedData);
 
 	return 0;
 }
@@ -1484,10 +1608,16 @@ void PipelineHandlerRPi::mapBuffers(Camera *camera, const RPi::BufferMap &buffer
 
 void RPiCameraData::freeBuffers()
 {
-	/* Copy the buffer ids from the unordered_set to a vector to pass to the IPA. */
-	std::vector<unsigned int> ipaBuffers(ipaBuffers_.begin(), ipaBuffers_.end());
-	ipa_->unmapBuffers(ipaBuffers);
-	ipaBuffers_.clear();
+	if (ipa_) {
+		/*
+		 * Copy the buffer ids from the unordered_set to a vector to
+		 * pass to the IPA.
+		 */
+		std::vector<unsigned int> ipaBuffers(ipaBuffers_.begin(),
+						     ipaBuffers_.end());
+		ipa_->unmapBuffers(ipaBuffers);
+		ipaBuffers_.clear();
+	}
 
 	for (auto const stream : streams_)
 		stream->releaseBuffers();
@@ -1503,7 +1633,7 @@ void RPiCameraData::frameStarted(uint32_t sequence)
 	delayedCtrls_->applyControls(sequence);
 }
 
-int RPiCameraData::loadIPA(ipa::RPi::SensorConfig *sensorConfig)
+int RPiCameraData::loadIPA(ipa::RPi::IPAInitResult *result)
 {
 	ipa_ = IPAManager::createIPA<ipa::RPi::IPAProxyRPi>(pipe(), 1, 1);
 
@@ -1515,6 +1645,7 @@ int RPiCameraData::loadIPA(ipa::RPi::SensorConfig *sensorConfig)
 	ipa_->embeddedComplete.connect(this, &RPiCameraData::embeddedComplete);
 	ipa_->setIspControls.connect(this, &RPiCameraData::setIspControls);
 	ipa_->setDelayedControls.connect(this, &RPiCameraData::setDelayedControls);
+	ipa_->setLensControls.connect(this, &RPiCameraData::setLensControls);
 
 	/*
 	 * The configuration (tuning file) is made from the sensor name unless
@@ -1522,34 +1653,30 @@ int RPiCameraData::loadIPA(ipa::RPi::SensorConfig *sensorConfig)
 	 */
 	std::string configurationFile;
 	char const *configFromEnv = utils::secure_getenv("LIBCAMERA_RPI_TUNING_FILE");
-	if (!configFromEnv || *configFromEnv == '\0')
-		configurationFile = ipa_->configurationFile(sensor_->model() + ".json");
-	else
+	if (!configFromEnv || *configFromEnv == '\0') {
+		std::string model = sensor_->model();
+		if (isMonoSensor(sensor_))
+			model += "_mono";
+		configurationFile = ipa_->configurationFile(model + ".json");
+	} else {
 		configurationFile = std::string(configFromEnv);
+	}
 
 	IPASettings settings(configurationFile, sensor_->model());
 
-	return ipa_->init(settings, sensorConfig);
+	return ipa_->init(settings, !!sensor_->focusLens(), result);
 }
 
 int RPiCameraData::configureIPA(const CameraConfiguration *config, ipa::RPi::IPAConfigResult *result)
 {
-	std::map<unsigned int, IPAStream> streamConfig;
 	std::map<unsigned int, ControlInfoMap> entityControls;
 	ipa::RPi::IPAConfig ipaConfig;
 
-	/* Inform IPA of stream configuration and sensor controls. */
-	unsigned int i = 0;
-	for (auto const &stream : isp_) {
-		if (stream.isExternal()) {
-			streamConfig[i++] = IPAStream(
-				stream.configuration().pixelFormat,
-				stream.configuration().size);
-		}
-	}
-
-	entityControls.emplace(0, sensor_->controls());
-	entityControls.emplace(1, isp_[Isp::Input].dev()->controls());
+	/* \todo Move passing of ispControls and lensControls to ipa::init() */
+	ipaConfig.sensorControls = sensor_->controls();
+	ipaConfig.ispControls = isp_[Isp::Input].dev()->controls();
+	if (sensor_->focusLens())
+		ipaConfig.lensControls = sensor_->focusLens()->controls();
 
 	/* Always send the user transform to the IPA. */
 	ipaConfig.transform = static_cast<unsigned int>(config->transform);
@@ -1577,8 +1704,7 @@ int RPiCameraData::configureIPA(const CameraConfiguration *config, ipa::RPi::IPA
 
 	/* Ready the IPA - it must know about the sensor resolution. */
 	ControlList controls;
-	ret = ipa_->configure(sensorInfo_, streamConfig, entityControls, ipaConfig,
-			      &controls, result);
+	ret = ipa_->configure(sensorInfo_, ipaConfig, &controls, result);
 	if (ret < 0) {
 		LOG(RPI, Error) << "IPA configuration failed!";
 		return -EPIPE;
@@ -1586,6 +1712,61 @@ int RPiCameraData::configureIPA(const CameraConfiguration *config, ipa::RPi::IPA
 
 	if (!controls.empty())
 		setSensorControls(controls);
+
+	return 0;
+}
+
+int RPiCameraData::loadPipelineConfiguration()
+{
+	config_ = {
+		.minUnicamBuffers = 2,
+		.minTotalUnicamBuffers = 4,
+		.disableStartupFrameDrops = false,
+	};
+
+	char const *configFromEnv = utils::secure_getenv("LIBCAMERA_RPI_CONFIG_FILE");
+	if (!configFromEnv || *configFromEnv == '\0')
+		return 0;
+
+	std::string filename = std::string(configFromEnv);
+	File file(filename);
+
+	if (!file.open(File::OpenModeFlag::ReadOnly)) {
+		LOG(RPI, Error) << "Failed to open configuration file '" << filename << "'";
+		return -EIO;
+	}
+
+	LOG(RPI, Info) << "Using configuration file '" << filename << "'";
+
+	std::unique_ptr<YamlObject> root = YamlParser::parse(file);
+	if (!root) {
+		LOG(RPI, Warning) << "Failed to parse configuration file, using defaults";
+		return 0;
+	}
+
+	std::optional<double> ver = (*root)["version"].get<double>();
+	if (!ver || *ver != 1.0) {
+		LOG(RPI, Error) << "Unexpected configuration file version reported";
+		return -EINVAL;
+	}
+
+	const YamlObject &phConfig = (*root)["pipeline_handler"];
+	config_.minUnicamBuffers =
+		phConfig["min_unicam_buffers"].get<unsigned int>(config_.minUnicamBuffers);
+	config_.minTotalUnicamBuffers =
+		phConfig["min_total_unicam_buffers"].get<unsigned int>(config_.minTotalUnicamBuffers);
+	config_.disableStartupFrameDrops =
+		phConfig["disable_startup_frame_drops"].get<bool>(config_.disableStartupFrameDrops);
+
+	if (config_.minTotalUnicamBuffers < config_.minUnicamBuffers) {
+		LOG(RPI, Error) << "Invalid configuration: min_total_unicam_buffers must be >= min_unicam_buffers";
+		return -EINVAL;
+	}
+
+	if (config_.minTotalUnicamBuffers < 1) {
+		LOG(RPI, Error) << "Invalid configuration: min_total_unicam_buffers must be >= 1";
+		return -EINVAL;
+	}
 
 	return 0;
 }
@@ -1684,10 +1865,10 @@ void RPiCameraData::enumerateVideoDevices(MediaLink *link)
 
 void RPiCameraData::statsMetadataComplete(uint32_t bufferId, const ControlList &controls)
 {
-	if (state_ == State::Stopped)
+	if (!isRunning())
 		return;
 
-	FrameBuffer *buffer = isp_[Isp::Stats].getBuffers().at(bufferId);
+	FrameBuffer *buffer = isp_[Isp::Stats].getBuffers().at(bufferId & RPi::MaskID);
 
 	handleStreamBuffer(buffer, &isp_[Isp::Stats]);
 
@@ -1699,15 +1880,15 @@ void RPiCameraData::statsMetadataComplete(uint32_t bufferId, const ControlList &
 	 * Inform the sensor of the latest colour gains if it has the
 	 * V4L2_CID_NOTIFY_GAINS control (which means notifyGainsUnity_ is set).
 	 */
-	if (notifyGainsUnity_ && controls.contains(libcamera::controls::ColourGains)) {
-		libcamera::Span<const float> colourGains = controls.get(libcamera::controls::ColourGains);
+	const auto &colourGains = controls.get(libcamera::controls::ColourGains);
+	if (notifyGainsUnity_ && colourGains) {
 		/* The control wants linear gains in the order B, Gb, Gr, R. */
 		ControlList ctrls(sensor_->controls());
 		std::array<int32_t, 4> gains{
-			static_cast<int32_t>(colourGains[1] * *notifyGainsUnity_),
+			static_cast<int32_t>((*colourGains)[1] * *notifyGainsUnity_),
 			*notifyGainsUnity_,
 			*notifyGainsUnity_,
-			static_cast<int32_t>(colourGains[0] * *notifyGainsUnity_)
+			static_cast<int32_t>((*colourGains)[0] * *notifyGainsUnity_)
 		};
 		ctrls.set(V4L2_CID_NOTIFY_GAINS, Span<const int32_t>{ gains });
 
@@ -1720,12 +1901,12 @@ void RPiCameraData::statsMetadataComplete(uint32_t bufferId, const ControlList &
 
 void RPiCameraData::runIsp(uint32_t bufferId)
 {
-	if (state_ == State::Stopped)
+	if (!isRunning())
 		return;
 
-	FrameBuffer *buffer = unicam_[Unicam::Image].getBuffers().at(bufferId);
+	FrameBuffer *buffer = unicam_[Unicam::Image].getBuffers().at(bufferId & RPi::MaskID);
 
-	LOG(RPI, Debug) << "Input re-queue to ISP, buffer id " << bufferId
+	LOG(RPI, Debug) << "Input re-queue to ISP, buffer id " << (bufferId & RPi::MaskID)
 			<< ", timestamp: " << buffer->metadata().timestamp;
 
 	isp_[Isp::Input].queueBuffer(buffer);
@@ -1735,10 +1916,10 @@ void RPiCameraData::runIsp(uint32_t bufferId)
 
 void RPiCameraData::embeddedComplete(uint32_t bufferId)
 {
-	if (state_ == State::Stopped)
+	if (!isRunning())
 		return;
 
-	FrameBuffer *buffer = unicam_[Unicam::Embedded].getBuffers().at(bufferId);
+	FrameBuffer *buffer = unicam_[Unicam::Embedded].getBuffers().at(bufferId & RPi::MaskID);
 	handleStreamBuffer(buffer, &unicam_[Unicam::Embedded]);
 	handleState();
 }
@@ -1760,11 +1941,21 @@ void RPiCameraData::setIspControls(const ControlList &controls)
 	handleState();
 }
 
-void RPiCameraData::setDelayedControls(const ControlList &controls)
+void RPiCameraData::setDelayedControls(const ControlList &controls, uint32_t delayContext)
 {
-	if (!delayedCtrls_->push(controls))
+	if (!delayedCtrls_->push(controls, delayContext))
 		LOG(RPI, Error) << "V4L2 DelayedControl set failed";
 	handleState();
+}
+
+void RPiCameraData::setLensControls(const ControlList &controls)
+{
+	CameraLens *lens = sensor_->focusLens();
+
+	if (lens && controls.contains(V4L2_CID_FOCUS_ABSOLUTE)) {
+		ControlValue const &focusValue = controls.get(V4L2_CID_FOCUS_ABSOLUTE);
+		lens->setFocusPosition(focusValue.get<int32_t>());
+	}
 }
 
 void RPiCameraData::setSensorControls(ControlList &controls)
@@ -1794,6 +1985,17 @@ void RPiCameraData::unicamTimeout()
 	LOG(RPI, Error) << "Unicam has timed out!";
 	LOG(RPI, Error) << "Please check that your camera sensor connector is attached securely.";
 	LOG(RPI, Error) << "Alternatively, try another cable and/or sensor.";
+
+	state_ = RPiCameraData::State::Error;
+	/*
+	 * To allow the application to attempt a recovery from this timeout,
+	 * stop all devices streaming, and return any outstanding requests as
+	 * incomplete and cancelled.
+	 */
+	for (auto const stream : streams_)
+		stream->dev()->streamOff();
+
+	clearIncompleteRequests();
 }
 
 void RPiCameraData::unicamBufferDequeue(FrameBuffer *buffer)
@@ -1801,7 +2003,7 @@ void RPiCameraData::unicamBufferDequeue(FrameBuffer *buffer)
 	RPi::Stream *stream = nullptr;
 	int index;
 
-	if (state_ == State::Stopped)
+	if (!isRunning())
 		return;
 
 	for (RPi::Stream &s : unicam_) {
@@ -1824,13 +2026,13 @@ void RPiCameraData::unicamBufferDequeue(FrameBuffer *buffer)
 		 * Lookup the sensor controls used for this frame sequence from
 		 * DelayedControl and queue them along with the frame buffer.
 		 */
-		ControlList ctrl = delayedCtrls_->get(buffer->metadata().sequence);
+		auto [ctrl, delayContext] = delayedCtrls_->get(buffer->metadata().sequence);
 		/*
 		 * Add the frame timestamp to the ControlList for the IPA to use
 		 * as it does not receive the FrameBuffer object.
 		 */
 		ctrl.set(controls::SensorTimestamp, buffer->metadata().timestamp);
-		bayerQueue_.push({ buffer, std::move(ctrl) });
+		bayerQueue_.push({ buffer, std::move(ctrl), delayContext });
 	} else {
 		embeddedQueue_.push(buffer);
 	}
@@ -1840,7 +2042,7 @@ void RPiCameraData::unicamBufferDequeue(FrameBuffer *buffer)
 
 void RPiCameraData::ispInputDequeue(FrameBuffer *buffer)
 {
-	if (state_ == State::Stopped)
+	if (!isRunning())
 		return;
 
 	LOG(RPI, Debug) << "Stream ISP Input buffer complete"
@@ -1857,7 +2059,7 @@ void RPiCameraData::ispOutputDequeue(FrameBuffer *buffer)
 	RPi::Stream *stream = nullptr;
 	int index;
 
-	if (state_ == State::Stopped)
+	if (!isRunning())
 		return;
 
 	for (RPi::Stream &s : isp_) {
@@ -1880,7 +2082,8 @@ void RPiCameraData::ispOutputDequeue(FrameBuffer *buffer)
 	 * application until after the IPA signals so.
 	 */
 	if (stream == &isp_[Isp::Stats]) {
-		ipa_->signalStatReady(ipa::RPi::MaskStats | static_cast<unsigned int>(index));
+		ipa_->signalStatReady(RPi::MaskStats | static_cast<unsigned int>(index),
+				      requestQueue_.front()->sequence());
 	} else {
 		/* Any other ISP output can be handed back to the application now. */
 		handleStreamBuffer(buffer, stream);
@@ -1955,7 +2158,7 @@ void RPiCameraData::handleExternalBuffer(FrameBuffer *buffer, RPi::Stream *strea
 {
 	unsigned int id = stream->getBufferId(buffer);
 
-	if (!(id & ipa::RPi::MaskExternalBuffer))
+	if (!(id & RPi::MaskExternalBuffer))
 		return;
 
 	/* Stop the Stream object from tracking the buffer. */
@@ -1967,6 +2170,7 @@ void RPiCameraData::handleState()
 	switch (state_) {
 	case State::Stopped:
 	case State::Busy:
+	case State::Error:
 		break;
 
 	case State::IpaComplete:
@@ -2034,8 +2238,9 @@ Rectangle RPiCameraData::scaleIspCrop(const Rectangle &ispCrop) const
 
 void RPiCameraData::applyScalerCrop(const ControlList &controls)
 {
-	if (controls.contains(controls::ScalerCrop)) {
-		Rectangle nativeCrop = controls.get<Rectangle>(controls::ScalerCrop);
+	const auto &scalerCrop = controls.get<Rectangle>(controls::ScalerCrop);
+	if (scalerCrop) {
+		Rectangle nativeCrop = *scalerCrop;
 
 		if (!nativeCrop.width || !nativeCrop.height)
 			nativeCrop = { 0, 0, 1, 1 };
@@ -2073,7 +2278,7 @@ void RPiCameraData::fillRequestMetadata(const ControlList &bufferControls,
 					Request *request)
 {
 	request->metadata().set(controls::SensorTimestamp,
-				bufferControls.get(controls::SensorTimestamp));
+				bufferControls.get(controls::SensorTimestamp).value_or(0));
 
 	request->metadata().set(controls::ScalerCrop, scalerCrop_);
 }
@@ -2121,13 +2326,15 @@ void RPiCameraData::tryRunPipeline()
 			<< " Bayer buffer id: " << bayerId;
 
 	ipa::RPi::ISPConfig ispPrepare;
-	ispPrepare.bayerBufferId = ipa::RPi::MaskBayerData | bayerId;
+	ispPrepare.bayerBufferId = RPi::MaskBayerData | bayerId;
 	ispPrepare.controls = std::move(bayerFrame.controls);
+	ispPrepare.ipaContext = request->sequence();
+	ispPrepare.delayContext = bayerFrame.delayContext;
 
 	if (embeddedBuffer) {
 		unsigned int embeddedId = unicam_[Unicam::Embedded].getBufferId(embeddedBuffer);
 
-		ispPrepare.embeddedBufferId = ipa::RPi::MaskEmbeddedData | embeddedId;
+		ispPrepare.embeddedBufferId = RPi::MaskEmbeddedData | embeddedId;
 		ispPrepare.embeddedBufferPresent = true;
 
 		LOG(RPI, Debug) << "Signalling signalIspPrepare:"
@@ -2142,16 +2349,12 @@ bool RPiCameraData::findMatchingBuffers(BayerFrame &bayerFrame, FrameBuffer *&em
 	if (bayerQueue_.empty())
 		return false;
 
-	/* Start with the front of the bayer queue. */
-	bayerFrame = std::move(bayerQueue_.front());
-	bayerQueue_.pop();
-
 	/*
 	 * Find the embedded data buffer with a matching timestamp to pass to
 	 * the IPA. Any embedded buffers with a timestamp lower than the
 	 * current bayer buffer will be removed and re-queued to the driver.
 	 */
-	uint64_t ts = bayerFrame.buffer->metadata().timestamp;
+	uint64_t ts = bayerQueue_.front().buffer->metadata().timestamp;
 	embeddedBuffer = nullptr;
 	while (!embeddedQueue_.empty()) {
 		FrameBuffer *b = embeddedQueue_.front();
@@ -2171,9 +2374,22 @@ bool RPiCameraData::findMatchingBuffers(BayerFrame &bayerFrame, FrameBuffer *&em
 	}
 
 	if (!embeddedBuffer && sensorMetadata_) {
+		if (embeddedQueue_.empty()) {
+			/*
+			 * If the embedded buffer queue is empty, wait for the next
+			 * buffer to arrive - dequeue ordering may send the image
+			 * buffer first.
+			 */
+			LOG(RPI, Debug) << "Waiting for next embedded buffer.";
+			return false;
+		}
+
 		/* Log if there is no matching embedded data buffer found. */
 		LOG(RPI, Debug) << "Returning bayer frame without a matching embedded buffer.";
 	}
+
+	bayerFrame = std::move(bayerQueue_.front());
+	bayerQueue_.pop();
 
 	return true;
 }

@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: BSD-2-Clause */
 /*
- * Copyright (C) 2020, Raspberry Pi (Trading) Limited
+ * Copyright (C) 2020, Raspberry Pi Ltd
  *
  * cam_helper_imx296.cpp - Camera helper for IMX296 sensor
  */
@@ -9,7 +9,7 @@
 #include <cmath>
 #include <stddef.h>
 
-#include "cam_helper.hpp"
+#include "cam_helper.h"
 
 using namespace RPiController;
 using libcamera::utils::Duration;
@@ -19,12 +19,15 @@ class CamHelperImx296 : public CamHelper
 {
 public:
 	CamHelperImx296();
-	uint32_t GainCode(double gain) const override;
-	double Gain(uint32_t gain_code) const override;
-	uint32_t ExposureLines(Duration exposure) const override;
-	Duration Exposure(uint32_t exposure_lines) const override;
+	uint32_t gainCode(double gain) const override;
+	double gain(uint32_t gainCode) const override;
+	uint32_t exposureLines(const Duration exposure, const Duration lineLength) const override;
+	Duration exposure(uint32_t exposureLines, const Duration lineLength) const override;
+	void getDelays(int &exposureDelay, int &gainDelay,
+		       int &vblankDelay, int &hblankDelay) const override;
 
 private:
+	static constexpr uint32_t minExposureLines = 1;
 	static constexpr uint32_t maxGainCode = 239;
 	static constexpr Duration timePerLine = 550.0 / 37.125e6 * 1.0s;
 
@@ -40,30 +43,41 @@ CamHelperImx296::CamHelperImx296()
 {
 }
 
-uint32_t CamHelperImx296::GainCode(double gain) const
+uint32_t CamHelperImx296::gainCode(double gain) const
 {
 	uint32_t code = 20 * std::log10(gain) * 10;
 	return std::min(code, maxGainCode);
 }
 
-double CamHelperImx296::Gain(uint32_t gain_code) const
+double CamHelperImx296::gain(uint32_t gainCode) const
 {
-	return std::pow(10.0, gain_code / 200.0);
+	return std::pow(10.0, gainCode / 200.0);
 }
 
-uint32_t CamHelperImx296::ExposureLines(Duration exposure) const
+uint32_t CamHelperImx296::exposureLines(const Duration exposure,
+					[[maybe_unused]] const Duration lineLength) const
 {
-	return (exposure - 14.26us) / timePerLine;
+	return std::max<uint32_t>(minExposureLines, (exposure - 14.26us) / timePerLine);
 }
 
-Duration CamHelperImx296::Exposure(uint32_t exposure_lines) const
+Duration CamHelperImx296::exposure(uint32_t exposureLines,
+				   [[maybe_unused]] const Duration lineLength) const
 {
-	return exposure_lines * timePerLine + 14.26us;
+	return std::max<uint32_t>(minExposureLines, exposureLines) * timePerLine + 14.26us;
 }
 
-static CamHelper *Create()
+void CamHelperImx296::getDelays(int &exposureDelay, int &gainDelay,
+				int &vblankDelay, int &hblankDelay) const
+{
+	exposureDelay = 2;
+	gainDelay = 2;
+	vblankDelay = 2;
+	hblankDelay = 2;
+}
+
+static CamHelper *create()
 {
 	return new CamHelperImx296();
 }
 
-static RegisterCamHelper reg("imx296", &Create);
+static RegisterCamHelper reg("imx296", &create);

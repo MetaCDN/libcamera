@@ -13,6 +13,7 @@ libcamera_sources = files([
     'controls.cpp',
     'control_serializer.cpp',
     'control_validator.cpp',
+    'converter.cpp',
     'delayed_controls.cpp',
     'device_enumerator.cpp',
     'device_enumerator_sysfs.cpp',
@@ -58,19 +59,37 @@ includes = [
 ]
 
 libatomic = cc.find_library('atomic', required : false)
+libthreads = dependency('threads')
 
 subdir('base')
+subdir('converter')
 subdir('ipa')
 subdir('pipeline')
 subdir('proxy')
 
-libdl = cc.find_library('dl')
-libgnutls = cc.find_library('gnutls', required : true)
-libudev = dependency('libudev', required : false)
-libyaml = dependency('yaml-0.1', required : true)
+null_dep = dependency('', required : false)
 
-if libgnutls.found()
+# TODO: Use dependency('dl') when updating to meson 0.62.0 or newer.
+libdl = null_dep
+if not cc.has_function('dlopen')
+    libdl = cc.find_library('dl')
+endif
+libudev = dependency('libudev', required : false)
+libyaml = dependency('yaml-0.1', required : false)
+
+# Use one of gnutls or libcrypto (provided by OpenSSL), trying gnutls first.
+libcrypto = dependency('gnutls', required : false)
+if libcrypto.found()
     config_h.set('HAVE_GNUTLS', 1)
+else
+    libcrypto = dependency('libcrypto', required : false)
+    if libcrypto.found()
+        config_h.set('HAVE_CRYPTO', 1)
+    endif
+endif
+
+if not libcrypto.found()
+    warning('Neither gnutls nor libcrypto found, all IPA modules will be isolated')
 endif
 
 if liblttng.found()
@@ -86,6 +105,17 @@ if libudev.found()
     libcamera_sources += files([
         'device_enumerator_udev.cpp',
     ])
+endif
+
+# Fallback to a subproject if libyaml isn't found, as it's not packaged in AOSP.
+if not libyaml.found()
+    cmake = import('cmake')
+
+    libyaml_vars = cmake.subproject_options()
+    libyaml_vars.add_cmake_defines({'CMAKE_POSITION_INDEPENDENT_CODE': 'ON'})
+    libyaml_vars.append_compile_args('c', '-Wno-unused-value')
+    libyaml_wrap = cmake.subproject('libyaml', options : libyaml_vars)
+    libyaml = libyaml_wrap.dependency('yaml')
 endif
 
 control_sources = []
@@ -124,8 +154,8 @@ libcamera_deps = [
     libatomic,
     libcamera_base,
     libcamera_base_private,
+    libcrypto,
     libdl,
-    libgnutls,
     liblttng,
     libudev,
     libyaml,
@@ -139,6 +169,7 @@ libcamera_deps = [
 libcamera = shared_library('libcamera',
                            libcamera_sources,
                            version : libcamera_version,
+                           soversion : libcamera_soversion,
                            name_prefix : '',
                            install : true,
                            include_directories : includes,
@@ -167,5 +198,7 @@ pkg_mod.generate(libcamera,
                  libraries : libcamera_base_lib,
                  description : 'Complex Camera Support Library',
                  subdirs : 'libcamera')
+
+meson.override_dependency('libcamera', libcamera_public)
 
 subdir('proxy/worker')

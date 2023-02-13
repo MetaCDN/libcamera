@@ -42,8 +42,8 @@ public:
 
 	int start();
 	void addCamera(std::shared_ptr<Camera> camera,
-		       const std::vector<dev_t> &devnums);
-	void removeCamera(Camera *camera);
+		       const std::vector<dev_t> &devnums) LIBCAMERA_TSA_EXCLUDES(mutex_);
+	void removeCamera(Camera *camera) LIBCAMERA_TSA_EXCLUDES(mutex_);
 
 	/*
 	 * This mutex protects
@@ -52,8 +52,8 @@ public:
 	 * - cameras_ and camerasByDevnum_ after initialization
 	 */
 	mutable Mutex mutex_;
-	std::vector<std::shared_ptr<Camera>> cameras_;
-	std::map<dev_t, std::weak_ptr<Camera>> camerasByDevnum_;
+	std::vector<std::shared_ptr<Camera>> cameras_ LIBCAMERA_TSA_GUARDED_BY(mutex_);
+	std::map<dev_t, std::weak_ptr<Camera>> camerasByDevnum_ LIBCAMERA_TSA_GUARDED_BY(mutex_);
 
 protected:
 	void run() override;
@@ -61,11 +61,11 @@ protected:
 private:
 	int init();
 	void createPipelineHandlers();
-	void cleanup();
+	void cleanup() LIBCAMERA_TSA_EXCLUDES(mutex_);
 
 	ConditionVariable cv_;
-	bool initialized_;
-	int status_;
+	bool initialized_ LIBCAMERA_TSA_GUARDED_BY(mutex_);
+	int status_ LIBCAMERA_TSA_GUARDED_BY(mutex_);
 
 	std::unique_ptr<DeviceEnumerator> enumerator_;
 
@@ -87,7 +87,9 @@ int CameraManager::Private::start()
 
 	{
 		MutexLocker locker(mutex_);
-		cv_.wait(locker, [&] { return initialized_; });
+		cv_.wait(locker, [&]() LIBCAMERA_TSA_REQUIRES(mutex_) {
+			return initialized_;
+		});
 		status = status_;
 	}
 
@@ -142,10 +144,10 @@ void CameraManager::Private::createPipelineHandlers()
 	 * file and only fallback on all handlers if there is no
 	 * configuration file.
 	 */
-	std::vector<PipelineHandlerFactory *> &factories =
-		PipelineHandlerFactory::factories();
+	const std::vector<PipelineHandlerFactoryBase *> &factories =
+		PipelineHandlerFactoryBase::factories();
 
-	for (PipelineHandlerFactory *factory : factories) {
+	for (const PipelineHandlerFactoryBase *factory : factories) {
 		LOG(Camera, Debug)
 			<< "Found registered pipeline handler '"
 			<< factory->name() << "'";
@@ -178,7 +180,11 @@ void CameraManager::Private::cleanup()
 	 * process deletion requests from the thread's message queue as the event
 	 * loop is not in action here.
 	 */
-	cameras_.clear();
+	{
+		MutexLocker locker(mutex_);
+		cameras_.clear();
+	}
+
 	dispatchMessages(Message::Type::DeferredDelete);
 
 	enumerator_.reset(nullptr);
@@ -189,7 +195,7 @@ void CameraManager::Private::addCamera(std::shared_ptr<Camera> camera,
 {
 	MutexLocker locker(mutex_);
 
-	for (std::shared_ptr<Camera> c : cameras_) {
+	for (const std::shared_ptr<Camera> &c : cameras_) {
 		if (c->id() == camera->id()) {
 			LOG(Camera, Fatal)
 				<< "Trying to register a camera with a duplicated ID '"

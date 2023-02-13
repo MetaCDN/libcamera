@@ -34,7 +34,7 @@ To fetch the sources, build and install:
 
   git clone https://git.libcamera.org/libcamera/libcamera.git
   cd libcamera
-  meson build
+  meson setup build
   ninja -C build install
 
 Dependencies
@@ -60,8 +60,11 @@ Meson Build system: [required]
 for the libcamera core: [required]
         libyaml-dev python3-yaml python3-ply python3-jinja2
 
-for IPA module signing: [required]
-        libgnutls28-dev openssl
+for IPA module signing: [recommended]
+        Either libgnutls28-dev or libssl-dev, openssl
+
+        Without IPA module signing, all IPA modules will be isolated in a
+        separate process. This adds an unnecessary extra overhead at runtime.
 
 for improved debugging: [optional]
         libdw-dev libunwind-dev
@@ -70,12 +73,6 @@ for improved debugging: [optional]
         failures. Their functions overlap, libdw provides the most detailed
         information, and libunwind is not needed if both libdw and the glibc
         backtrace() function are available.
-
-for the Raspberry Pi IPA: [optional]
-        libboost-dev
-
-        Support for Raspberry Pi can be disabled through the meson
-         'pipelines' option to avoid this dependency.
 
 for device hotplug enumeration: [optional]
         libudev-dev
@@ -87,7 +84,13 @@ for gstreamer: [optional]
         libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev
 
 for cam: [optional]
-        libevent-dev
+        libevent-dev is required to support cam, however the following
+        optional dependencies bring more functionality to the cam test
+        tool:
+
+        - libdrm-dev: Enables the KMS sink
+        - libjpeg-dev: Enables MJPEG on the SDL sink
+        - libsdl2-dev: Enables the SDL sink
 
 for qcam: [optional]
         qtbase5-dev libqt5core5a libqt5gui5 libqt5widgets5 qttools5-dev-tools libtiff-dev
@@ -100,6 +103,21 @@ for android: [optional]
 
 for lc-compliance: [optional]
         libevent-dev
+
+Basic testing with cam utility
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The ``cam`` utility can be used for basic testing. You can list the cameras
+detected on the system with ``cam -l``, and capture ten frames from the first
+camera and save them to disk with ``cam -c 1 --capture=10 --file``. See
+``cam -h`` for more information about the ``cam`` tool.
+
+In case of problems, a detailed debug log can be obtained from libcamera by
+setting the ``LIBCAMERA_LOG_LEVELS`` environment variable:
+
+.. code::
+
+    :~$ LIBCAMERA_LOG_LEVELS=*:DEBUG cam -l
 
 Using GStreamer plugin
 ~~~~~~~~~~~~~~~~~~~~~~

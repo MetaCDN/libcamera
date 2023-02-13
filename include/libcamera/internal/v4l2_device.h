@@ -22,6 +22,8 @@
 #include <libcamera/color_space.h>
 #include <libcamera/controls.h>
 
+#include "libcamera/internal/formats.h"
+
 namespace libcamera {
 
 class EventNotifier;
@@ -59,7 +61,8 @@ protected:
 	int fd() const { return fd_.get(); }
 
 	template<typename T>
-	static std::optional<ColorSpace> toColorSpace(const T &v4l2Format);
+	static std::optional<ColorSpace> toColorSpace(const T &v4l2Format,
+						      PixelFormatInfo::ColourEncoding colourEncoding);
 
 	template<typename T>
 	static int fromColorSpace(const std::optional<ColorSpace> &colorSpace, T &v4l2Format);
@@ -67,8 +70,8 @@ protected:
 private:
 	static ControlType v4l2CtrlType(uint32_t ctrlType);
 	static std::unique_ptr<ControlId> v4l2ControlId(const v4l2_query_ext_ctrl &ctrl);
-	ControlInfo v4l2ControlInfo(const v4l2_query_ext_ctrl &ctrl);
-	ControlInfo v4l2MenuControlInfo(const v4l2_query_ext_ctrl &ctrl);
+	std::optional<ControlInfo> v4l2ControlInfo(const v4l2_query_ext_ctrl &ctrl);
+	std::optional<ControlInfo> v4l2MenuControlInfo(const v4l2_query_ext_ctrl &ctrl);
 
 	void listControls();
 	void updateControls(ControlList *ctrls,

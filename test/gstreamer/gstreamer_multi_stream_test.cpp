@@ -29,7 +29,7 @@ class GstreamerMultiStreamTest : public GstreamerTest, public Test
 {
 public:
 	GstreamerMultiStreamTest()
-		: GstreamerTest()
+		: GstreamerTest(2)
 	{
 	}
 
@@ -38,24 +38,6 @@ protected:
 	{
 		if (status_ != TestPass)
 			return status_;
-
-		/* Check if platform supports multistream capture */
-		libcamera::CameraManager cm;
-		cm.start();
-		bool cameraFound = false;
-		for (auto &camera : cm.cameras()) {
-			if (camera->streams().size() > 1) {
-				cameraName_ = camera->id();
-				cameraFound = true;
-				cm.stop();
-				break;
-			}
-		}
-
-		if (!cameraFound) {
-			cm.stop();
-			return TestSkip;
-		}
 
 		const gchar *streamDescription = "queue ! fakesink";
 		g_autoptr(GError) error = NULL;
@@ -88,8 +70,6 @@ protected:
 
 	int run() override
 	{
-		g_object_set(libcameraSrc_, "camera-name", cameraName_.c_str(), NULL);
-
 		/* Build the pipeline */
 		gst_bin_add_many(GST_BIN(pipeline_), libcameraSrc_,
 				 stream0_, stream1_, NULL);
@@ -124,7 +104,6 @@ protected:
 	}
 
 private:
-	std::string cameraName_;
 	GstElement *stream0_;
 	GstElement *stream1_;
 };

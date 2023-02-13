@@ -98,7 +98,7 @@ private:
 				return TestFail;
 			}
 
-			requests_.push_back(move(request));
+			requests_.push_back(std::move(request));
 		}
 
 		camera_->requestCompleted.connect(this, &CameraReconfigure::requestComplete);
@@ -179,7 +179,7 @@ private:
 				continue;
 
 			string pname("/proc/" + string(ptr->d_name) + "/comm");
-			if (File::exists(pname.c_str())) {
+			if (File::exists(pname)) {
 				ifstream pfile(pname.c_str());
 				string comm;
 				getline(pfile, comm);
